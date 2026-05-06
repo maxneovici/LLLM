@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLLM</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">Local LLM Workbench</p>
+        <h1>LLLM</h1>
+        <p class="subtitle">Chat with local Ollama models, call tools, and extract text or invoice data from dropped PDFs/images.</p>
+      </div>
+      <div class="status-card">
+        <span id="healthDot" class="dot"></span>
+        <div>
+          <strong id="healthText">Checking Ollama</strong>
+          <span id="healthSubtext">http://127.0.0.1:11434</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="workspace">
+      <aside class="panel controls">
+        <label for="modelSelect">Local model</label>
+        <select id="modelSelect"></select>
+        <button id="refreshModels" class="secondary">Refresh Models</button>
+
+        <label for="systemPrompt">System prompt</label>
+        <textarea id="systemPrompt" rows="5">You are LLLM, a concise local-only assistant. Use tools when they help.</textarea>
+
+        <div class="toggles">
+          <label><input id="thinkingToggle" type="checkbox" checked> reasoning</label>
+        </div>
+
+        <div id="dropzone" class="dropzone">
+          <input id="fileInput" type="file" accept="application/pdf,image/*" hidden>
+          <div class="drop-icon">PDF</div>
+          <strong>Drop PDF/image</strong>
+          <span>or click to upload</span>
+        </div>
+
+        <div id="documentCard" class="document-card empty">No document uploaded.</div>
+
+        <div class="button-row">
+          <button id="ocrButton">Run OCR</button>
+          <button id="invoiceButton" class="secondary">Extract Invoice</button>
+        </div>
+      </aside>
+
+      <section class="panel chat-panel">
+        <div id="messages" class="messages"></div>
+        <form id="chatForm" class="composer">
+          <textarea id="messageInput" rows="3" placeholder="Ask a question, request OCR, or ask it to use tools..."></textarea>
+          <button type="submit">Send</button>
+        </form>
+      </section>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
