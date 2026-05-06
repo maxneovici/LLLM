@@ -92,21 +92,28 @@ app.MapPost("/api/documents", async (HttpRequest request, AppState state, IWebHo
 
 app.MapPost("/api/transcribe", async (HttpRequest request, SpeechTranscriber transcriber, CancellationToken cancellationToken) =>
 {
-    if (!request.HasFormContentType)
+    try
     {
-        return Results.BadRequest(new ErrorResponse("Expected multipart form data."));
+        if (!request.HasFormContentType)
+        {
+            return Results.BadRequest(new ErrorResponse("Expected multipart form data."));
+        }
+
+        var form = await request.ReadFormAsync(cancellationToken);
+        var file = form.Files.GetFile("audio");
+
+        if (file is null || file.Length == 0)
+        {
+            return Results.BadRequest(new ErrorResponse("Record audio before transcribing."));
+        }
+
+        var result = await transcriber.TranscribeAsync(file, cancellationToken);
+        return Results.Ok(result);
     }
-
-    var form = await request.ReadFormAsync(cancellationToken);
-    var file = form.Files.GetFile("audio");
-
-    if (file is null || file.Length == 0)
+    catch (Exception exception) when (exception is InvalidOperationException or IOException or UnauthorizedAccessException)
     {
-        return Results.BadRequest(new ErrorResponse("Record audio before transcribing."));
+        return Results.BadRequest(new ErrorResponse(exception.Message));
     }
-
-    var result = await transcriber.TranscribeAsync(file, cancellationToken);
-    return Results.Ok(result);
 });
 
 app.MapPost("/api/chat", async (ChatRequest request, OllamaClient ollama, LocalToolRegistry tools, AppState state, CancellationToken cancellationToken) =>

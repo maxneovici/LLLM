@@ -3,7 +3,17 @@ const state = {
   busy: false,
   currentDocument: null,
   mediaRecorder: null,
-  audioChunks: [],
+  micStream: null,
+  audioContext: null,
+  analyser: null,
+  silenceMonitor: null,
+  autoSendTimer: null,
+  chunkTimer: null,
+  stoppingForNextChunk: false,
+  nextAudioChunkId: 0,
+  nextTranscriptChunkId: 0,
+  transcriptBuffer: new Map(),
+  pendingTranscriptions: 0,
   recordingStartedAt: 0,
   recordingTimer: null
 };
@@ -77,7 +87,7 @@ function bindEvents() {
 
 async function toggleRecording() {
   if (state.mediaRecorder?.state === 'recording') {
-    state.mediaRecorder.stop();
+    stopRecording({ autoSend: false });
     return;
   }
 
@@ -85,23 +95,81 @@ async function toggleRecording() {
 
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    state.audioChunks = [];
-    state.mediaRecorder = new MediaRecorder(stream);
-    state.mediaRecorder.addEventListener('dataavailable', event => {
-      if (event.data.size > 0) {
-        state.audioChunks.push(event.data);
-      }
-    });
-    state.mediaRecorder.addEventListener('stop', async () => {
-      stream.getTracks().forEach(track => track.stop());
-      stopRecordingUi();
-      await transcribeRecording();
-    });
-
-    state.mediaRecorder.start();
+    state.micStream = stream;
+    state.nextAudioChunkId = 0;
+    state.nextTranscriptChunkId = 0;
+    state.transcriptBuffer.clear();
     startRecordingUi();
+    startSilenceMonitor(stream);
+    startVoiceChunk();
   } catch (error) {
     addMessage('error', `Microphone unavailable: ${error.message}`);
+  }
+}
+
+function getRecorderOptions() {
+  if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+    return { mimeType: 'audio/webm;codecs=opus' };
+  }
+
+  return {};
+}
+
+function startVoiceChunk() {
+  if (!state.micStream) {
+    return;
+  }
+
+  const recorder = new MediaRecorder(state.micStream, getRecorderOptions());
+  const chunks = [];
+  const chunkId = state.nextAudioChunkId++;
+  state.mediaRecorder = recorder;
+
+  recorder.addEventListener('dataavailable', event => {
+    if (event.data.size > 0) {
+      chunks.push(event.data);
+    }
+  });
+
+  recorder.addEventListener('stop', () => {
+    if (chunks.length > 0) {
+      const blob = new Blob(chunks, { type: chunks[0].type || recorder.mimeType || 'audio/webm' });
+      void transcribeAudioChunk(blob, chunkId);
+    }
+
+    if (state.stoppingForNextChunk && state.micStream) {
+      state.stoppingForNextChunk = false;
+      startVoiceChunk();
+    }
+  });
+
+  recorder.start();
+  state.chunkTimer = window.setTimeout(() => rotateVoiceChunk(), 1600);
+}
+
+function rotateVoiceChunk() {
+  if (state.mediaRecorder?.state !== 'recording') {
+    return;
+  }
+
+  state.stoppingForNextChunk = true;
+  state.mediaRecorder.stop();
+}
+
+function stopRecording({ autoSend }) {
+  window.clearTimeout(state.chunkTimer);
+  state.stoppingForNextChunk = false;
+
+  if (state.mediaRecorder?.state === 'recording') {
+    state.mediaRecorder.stop();
+  }
+
+  stopRecordingUi();
+  cleanupRecordingResources();
+  clearAutoSendTimer();
+
+  if (autoSend) {
+    scheduleAutoSend(700);
   }
 }
 
@@ -109,7 +177,7 @@ function startRecordingUi() {
   state.recordingStartedAt = performance.now();
   voiceButton.classList.add('recording');
   voiceButton.textContent = 'Stop 0.0s';
-  showVoiceStatus('Recording locally. Click Stop when done.', 'recording');
+  showVoiceStatus('Listening. Transcribing short chunks locally.', 'recording');
   state.recordingTimer = window.setInterval(() => {
     voiceButton.textContent = `Stop ${((performance.now() - state.recordingStartedAt) / 1000).toFixed(1)}s`;
   }, 250);
@@ -124,42 +192,146 @@ function stopRecordingUi() {
   voiceButton.textContent = 'Mic';
 }
 
-async function transcribeRecording() {
-  if (state.audioChunks.length === 0) return;
+function cleanupRecordingResources() {
+  state.micStream?.getTracks().forEach(track => track.stop());
+  state.audioContext?.close();
+  window.clearInterval(state.silenceMonitor);
+  state.micStream = null;
+  state.audioContext = null;
+  state.analyser = null;
+  state.silenceMonitor = null;
+}
 
-  setBusy(true);
+function startSilenceMonitor(stream) {
+  state.audioContext = new AudioContext();
+  const source = state.audioContext.createMediaStreamSource(stream);
+  state.analyser = state.audioContext.createAnalyser();
+  state.analyser.fftSize = 2048;
+  source.connect(state.analyser);
+
+  const samples = new Uint8Array(state.analyser.fftSize);
+  let silentSince = null;
+
+  state.silenceMonitor = window.setInterval(() => {
+    state.analyser.getByteTimeDomainData(samples);
+    let sum = 0;
+
+    for (const sample of samples) {
+      const normalized = (sample - 128) / 128;
+      sum += normalized * normalized;
+    }
+
+    const rms = Math.sqrt(sum / samples.length);
+    const now = performance.now();
+
+    if (rms < 0.018) {
+      silentSince ??= now;
+      const silentMs = now - silentSince;
+      showVoiceStatus(`Listening. Auto-send after silence: ${Math.max(0, 4 - silentMs / 1000).toFixed(1)}s`, 'recording');
+
+      if (silentMs >= 4000 && messageInput.value.trim()) {
+        stopRecording({ autoSend: true });
+      }
+    } else {
+      silentSince = null;
+      clearAutoSendTimer();
+      showVoiceStatus('Listening. Transcribing short chunks locally.', 'recording');
+    }
+  }, 250);
+}
+
+async function transcribeAudioChunk(chunk, chunkId) {
+  if (chunk.size < 1024) {
+    return;
+  }
+
+  state.pendingTranscriptions += 1;
+  setVoiceBusy(true);
+  showVoiceStatus(`Transcribing chunk ${state.pendingTranscriptions} locally`, 'transcribing');
+
   const progress = createVoiceProgress();
 
   try {
-    const blob = new Blob(state.audioChunks, { type: state.audioChunks[0]?.type || 'audio/webm' });
     const form = new FormData();
-    form.append('audio', blob, 'recording.webm');
+    form.append('audio', chunk, 'chunk.webm');
 
-    progress.setStep('Sending audio to local whisper.cpp');
+    progress.setStep('Sending audio chunk to local whisper.cpp');
     const response = await fetch('/api/transcribe', { method: 'POST', body: form });
-    progress.setStep('Reading local transcript');
+    progress.setStep('Reading local partial transcript');
     const result = await readJsonOrThrow(response);
-    appendTranscriptToComposer(result.text);
+    const cleanedTranscript = cleanTranscript(result.text);
+    bufferTranscriptChunk(chunkId, cleanedTranscript);
     messageInput.focus();
-    progress.complete(result);
+    progress.complete({ ...result, text: cleanedTranscript });
   } catch (error) {
     progress.fail(error);
-    addMessage('error', `Voice transcription failed: ${error.message}`);
+    showVoiceStatus(`Voice chunk skipped: ${error.message}`, 'failed');
   } finally {
-    setBusy(false);
+    state.pendingTranscriptions = Math.max(0, state.pendingTranscriptions - 1);
+    setVoiceBusy(false);
+
+    if (state.mediaRecorder?.state === 'recording') {
+      showVoiceStatus('Listening. Transcribing short chunks locally.', 'recording');
+    }
+  }
+}
+
+function bufferTranscriptChunk(chunkId, text) {
+  state.transcriptBuffer.set(chunkId, cleanTranscript(text));
+
+  while (state.transcriptBuffer.has(state.nextTranscriptChunkId)) {
+    appendTranscriptToComposer(state.transcriptBuffer.get(state.nextTranscriptChunkId));
+    state.transcriptBuffer.delete(state.nextTranscriptChunkId);
+    state.nextTranscriptChunkId += 1;
   }
 }
 
 function appendTranscriptToComposer(text) {
-  const transcript = text.trim();
+  const transcript = cleanTranscript(text);
 
   if (!transcript) {
     return;
   }
 
   const existingText = messageInput.value.trimEnd();
-  messageInput.value = existingText ? `${existingText}\n${transcript}` : transcript;
+  const separator = existingText && !/[\s\n]$/.test(existingText) ? ' ' : '';
+  messageInput.value = existingText ? `${existingText}${separator}${transcript}` : transcript;
   messageInput.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function cleanTranscript(text) {
+  return (text ?? '')
+    .replace(/\[(?:BLANK_AUDIO|SILENCE|MUSIC|NO_AUDIO|INAUDIBLE)\]/gi, ' ')
+    .replace(/\[[^\]]*blank[^\]]*\]/gi, ' ')
+    .replace(/\((?:blank audio|silence|music|no audio|inaudible)\)/gi, ' ')
+    .replace(/<\|[^>]+\|>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function scheduleAutoSend(delayMs) {
+  clearAutoSendTimer();
+  state.autoSendTimer = window.setTimeout(() => {
+    if (state.pendingTranscriptions > 0) {
+      scheduleAutoSend(500);
+      return;
+    }
+
+    if (messageInput.value.trim() && !state.busy) {
+      chatForm.requestSubmit();
+    }
+  }, delayMs);
+}
+
+function clearAutoSendTimer() {
+  if (state.autoSendTimer) {
+    window.clearTimeout(state.autoSendTimer);
+    state.autoSendTimer = null;
+  }
+}
+
+function setVoiceBusy(busy) {
+  voiceButton.disabled = busy && state.mediaRecorder?.state !== 'recording';
 }
 
 async function checkHealth() {

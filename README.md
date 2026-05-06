@@ -42,4 +42,4 @@ Then update `appsettings.json` if needed:
 }
 ```
 
-Use the `Mic` button to record. The transcript is inserted into the prompt box for review before sending.
+Use the `Mic` button to record. LLLM transcribes short local chunks into the prompt box and auto-sends after a few seconds of silence.
