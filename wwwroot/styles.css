@@ -603,10 +603,96 @@ textarea {
 .reasoning-body {
   padding: 0 12px 12px;
   color: #fcd34d;
-  white-space: pre-wrap;
 }
 
-.answer-stream { white-space: pre-wrap; }
+.answer-stream,
+.markdown-body {
+  line-height: 1.55;
+}
+
+.answer-stream > :first-child,
+.markdown-body > :first-child,
+.reasoning-body > :first-child { margin-top: 0; }
+
+.answer-stream > :last-child,
+.markdown-body > :last-child,
+.reasoning-body > :last-child { margin-bottom: 0; }
+
+.answer-stream p,
+.markdown-body p,
+.reasoning-body p { margin: 0.45rem 0; }
+
+.answer-stream h1,
+.answer-stream h2,
+.answer-stream h3,
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3 {
+  margin: 0.72rem 0 0.38rem;
+  line-height: 1.15;
+}
+
+.answer-stream h1,
+.markdown-body h1 { font-size: 1.35rem; }
+
+.answer-stream h2,
+.markdown-body h2 { font-size: 1.14rem; }
+
+.answer-stream h3,
+.markdown-body h3 { font-size: 1rem; }
+
+.answer-stream ul,
+.answer-stream ol,
+.markdown-body ul,
+.markdown-body ol,
+.reasoning-body ul,
+.reasoning-body ol {
+  margin: 0.42rem 0;
+  padding-left: 1.28rem;
+}
+
+.answer-stream li,
+.markdown-body li,
+.reasoning-body li { margin: 0.25rem 0; }
+
+.answer-stream code,
+.markdown-body code,
+.reasoning-body code {
+  padding: 0.1rem 0.32rem;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 7px;
+  color: #e0f2fe;
+  background: rgba(2, 6, 23, 0.62);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+
+.answer-stream pre,
+.markdown-body pre,
+.reasoning-body pre {
+  margin: 0.65rem 0;
+  padding: 0.86rem;
+  border: 1px solid rgba(125, 211, 252, 0.18);
+  border-radius: 14px;
+  background: rgba(2, 6, 23, 0.74);
+  overflow: auto;
+}
+
+.answer-stream pre code,
+.markdown-body pre code,
+.reasoning-body pre code {
+  display: block;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  white-space: pre;
+}
+
+.answer-stream a,
+.markdown-body a {
+  color: var(--accent);
+}
 
 .streaming::after {
   content: '';

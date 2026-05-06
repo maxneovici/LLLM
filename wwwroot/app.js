@@ -635,12 +635,12 @@ function handleStreamEvent(event, assistant) {
   switch (event.type) {
     case 'reasoning':
       assistant.reasoningText += event.text ?? '';
-      assistant.reasoningBody.textContent = assistant.reasoningText;
+      renderMarkdownInto(assistant.reasoningBody, assistant.reasoningText);
       assistant.reasoning.hidden = false;
       break;
     case 'content':
       assistant.answerText += event.text ?? '';
-      assistant.answer.textContent = assistant.answerText;
+      renderMarkdownInto(assistant.answer, assistant.answerText);
       break;
     case 'tool':
       if (event.toolResult) {
@@ -912,6 +912,140 @@ function renderChatResult(result) {
   addMessage('assistant', result.response || '(empty response)', meta.filter(Boolean).join(' | '));
 }
 
+function renderMarkdownInto(container, markdown) {
+  container.innerHTML = '';
+  container.append(...parseMarkdown(markdown));
+}
+
+function parseMarkdown(markdown) {
+  const source = (markdown ?? '').replace(/\r\n/g, '\n');
+  const nodes = [];
+  const lines = source.split('\n');
+  let paragraph = [];
+  let list = null;
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    const element = document.createElement('p');
+    appendInlineMarkdown(element, paragraph.join('\n'));
+    nodes.push(element);
+    paragraph = [];
+  };
+
+  const flushList = () => {
+    if (!list) return;
+    nodes.push(list);
+    list = null;
+  };
+
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    const fence = line.match(/^```(\w+)?\s*$/);
+
+    if (fence) {
+      flushParagraph();
+      flushList();
+      const codeLines = [];
+      index += 1;
+
+      while (index < lines.length && !lines[index].startsWith('```')) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+
+      const pre = document.createElement('pre');
+      const code = document.createElement('code');
+      if (fence[1]) code.dataset.language = fence[1];
+      code.textContent = codeLines.join('\n');
+      pre.appendChild(code);
+      nodes.push(pre);
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      const level = heading[1].length;
+      const element = document.createElement(`h${level}`);
+      appendInlineMarkdown(element, heading[2]);
+      nodes.push(element);
+      continue;
+    }
+
+    const listItem = line.match(/^\s*[-*]\s+(.+)$/);
+    if (listItem) {
+      flushParagraph();
+      list ??= document.createElement('ul');
+      const item = document.createElement('li');
+      appendInlineMarkdown(item, listItem[1]);
+      list.appendChild(item);
+      continue;
+    }
+
+    const orderedItem = line.match(/^\s*\d+\.\s+(.+)$/);
+    if (orderedItem) {
+      flushParagraph();
+      if (!list || list.tagName !== 'OL') {
+        flushList();
+        list = document.createElement('ol');
+      }
+      const item = document.createElement('li');
+      appendInlineMarkdown(item, orderedItem[1]);
+      list.appendChild(item);
+      continue;
+    }
+
+    flushList();
+    paragraph.push(line);
+  }
+
+  flushParagraph();
+  flushList();
+  return nodes.length ? nodes : [document.createTextNode('')];
+}
+
+function appendInlineMarkdown(parent, text) {
+  const pattern = /(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`|\[[^\]]+\]\([^\s)]+\))/g;
+  let lastIndex = 0;
+
+  for (const match of text.matchAll(pattern)) {
+    parent.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+    const token = match[0];
+
+    if (token.startsWith('**')) {
+      const strong = document.createElement('strong');
+      strong.textContent = token.slice(2, -2);
+      parent.appendChild(strong);
+    } else if (token.startsWith('*')) {
+      const em = document.createElement('em');
+      em.textContent = token.slice(1, -1);
+      parent.appendChild(em);
+    } else if (token.startsWith('`')) {
+      const code = document.createElement('code');
+      code.textContent = token.slice(1, -1);
+      parent.appendChild(code);
+    } else {
+      const link = token.match(/^\[([^\]]+)\]\(([^\s)]+)\)$/);
+      const anchor = document.createElement('a');
+      anchor.textContent = link?.[1] ?? token;
+      anchor.href = link?.[2] ?? '#';
+      anchor.rel = 'noreferrer';
+      parent.appendChild(anchor);
+    }
+
+    lastIndex = (match.index ?? 0) + token.length;
+  }
+
+  parent.appendChild(document.createTextNode(text.slice(lastIndex)));
+}
+
 function renderDocumentResult(result) {
   const text = result.pages.map(page => `Page ${page.page}\n${page.text}\n\n${formatStats(page.stats)}`).join('\n\n---\n\n');
   addMessage('tool', text, `${result.operation} total wall time ${formatMs(result.totalDurationMs)}`);
@@ -950,7 +1084,10 @@ function renderDocument(document, uploadResult = null) {
 function addMessage(role, text, meta = '') {
   const bubble = document.createElement('article');
   bubble.className = `message ${role}`;
-  bubble.textContent = text;
+  const body = document.createElement('div');
+  body.className = 'markdown-body';
+  renderMarkdownInto(body, text);
+  bubble.appendChild(body);
 
   if (meta) {
     const metaEl = document.createElement('div');

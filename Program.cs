@@ -467,33 +467,35 @@ static ReasoningRoute ClassifyReasoningEffort(string message, int? requestedMemo
     var wordCount = text.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Length;
     var casualPhrases = new[]
     {
-        "hello", "hey", "sup", "thanks", "thank you", "okay", "cool", "nice",
-        "how are you", "how's it going", "hows it going", "what's up", "whats up", "good morning", "good night"
+        "hello", "hey", "howdy", "hiya", "sup", "wassup", "thanks", "thank you", "okay", "cool", "nice", "awesome", "great",
+        "how are you", "how's it going", "hows it going", "how's your day", "hows your day", "how are things", "how goes",
+        "what's up", "whats up", "what's good", "whats good", "good morning", "good afternoon", "good evening", "good night"
     };
     var complexSignals = new[]
     {
         "analyze", "compare", "debug", "fix", "implement", "refactor", "architect", "design", "plan", "prove",
         "explain why", "step by step", "tradeoff", "trade-off", "invoice", "ocr", "document", "pdf", "tool", "memory", "search",
-        "summarize", "extract", "calculate", "reason", "deep", "thorough"
+        "summarize", "extract", "calculate", "reason", "deep", "thorough", "capability", "capabilities", "available", "list all"
     };
 
     var tokens = Regex.Matches(lower, "[a-z0-9']+").Select(match => match.Value).ToHashSet(StringComparer.OrdinalIgnoreCase);
+    var looksComplex = text.Length >= 260 || wordCount >= 45 || complexSignals.Any(signal => lower.Contains(signal, StringComparison.Ordinal));
     var looksLikeCasualGreeting = casualPhrases.Any(pattern => lower.Contains(pattern, StringComparison.Ordinal))
-        || tokens.Overlaps(["hi", "yo", "ok"])
+        || tokens.Overlaps(["hi", "yo", "ok", "gm", "gn", "lol", "haha"])
         || (tokens.Contains("how") && (tokens.Contains("going") || tokens.Contains("goin")))
         || (tokens.Contains("what") && tokens.Contains("up"));
 
-    if (wordCount <= 12 && text.Length <= 90 && looksLikeCasualGreeting)
+    if (!looksComplex && wordCount <= 12 && text.Length <= 90 && looksLikeCasualGreeting)
     {
         return BuildRoute("fast", "Casual short message; skipping memory, tools, and reasoning for minimum latency.", think: false, useMemory: false, useTools: false, memoryLimit: 0, temperature: 0.82);
     }
 
-    if (text.Length <= 55 && wordCount <= 8 && !text.Contains('?') && !complexSignals.Any(signal => lower.Contains(signal)))
+    if (!looksComplex && text.Length <= 55 && wordCount <= 8 && !text.Contains('?'))
     {
         return BuildRoute("fast", "Short low-risk turn; optimized for conversational speed.", think: false, useMemory: false, useTools: false, memoryLimit: 0, temperature: 0.82);
     }
 
-    if (text.Length >= 260 || wordCount >= 45 || complexSignals.Any(signal => lower.Contains(signal)))
+    if (looksComplex)
     {
         return BuildRoute("deep", "Complex or tool/document-like request; enabling memory, tools, and reasoning.", think: true, useMemory: true, useTools: true, memoryLimit: requestedMemoryLimit ?? 8, temperature: 0.55);
     }
