@@ -53,9 +53,13 @@
         <label for="systemPrompt">System prompt</label>
         <textarea id="systemPrompt" rows="5">You are LLLM, a concise local-only assistant. Use tools when they help.</textarea>
 
-        <div class="toggles">
-          <label><input id="thinkingToggle" type="checkbox" checked> reasoning</label>
-        </div>
+        <label for="reasoningMode">Reasoning effort</label>
+        <select id="reasoningMode">
+          <option value="auto" selected>Auto: fastest viable</option>
+          <option value="fast">Fast: casual/no memory</option>
+          <option value="balanced">Balanced: memory + tools</option>
+          <option value="deep">Deep: harder tasks</option>
+        </select>
 
         <div id="dropzone" class="dropzone">
           <input id="fileInput" type="file" accept="application/pdf,image/*,.txt,.md,.csv,.json,.log" hidden>

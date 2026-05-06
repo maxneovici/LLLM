@@ -28,7 +28,7 @@ const unloadModelButton = document.querySelector('#unloadModelButton');
 const pullModelButton = document.querySelector('#pullModelButton');
 const loadedModels = document.querySelector('#loadedModels');
 const systemPrompt = document.querySelector('#systemPrompt');
-const thinkingToggle = document.querySelector('#thinkingToggle');
+const reasoningMode = document.querySelector('#reasoningMode');
 const dropzone = document.querySelector('#dropzone');
 const fileInput = document.querySelector('#fileInput');
 const documentCard = document.querySelector('#documentCard');
@@ -589,7 +589,7 @@ async function sendChat(message) {
         model: state.model,
         message,
         systemPrompt: systemPrompt.value,
-        enableThinking: thinkingToggle.checked
+        reasoningMode: reasoningMode.value
       })
     });
 
@@ -655,6 +655,10 @@ function handleStreamEvent(event, assistant) {
       assistant.memories = event.memories ?? [];
       renderUsedMemories(assistant);
       break;
+    case 'route':
+      assistant.route = event.route;
+      renderRoute(assistant);
+      break;
     case 'error':
       addMessage('error', event.error ?? 'Unknown stream error');
       break;
@@ -680,6 +684,9 @@ function createAssistantStreamMessage() {
 
   const answer = document.createElement('div');
   answer.className = 'answer-stream';
+  const route = document.createElement('div');
+  route.className = 'route-pill';
+  route.hidden = true;
   const memory = document.createElement('details');
   memory.className = 'used-memory';
   memory.hidden = true;
@@ -691,11 +698,26 @@ function createAssistantStreamMessage() {
   const meta = document.createElement('div');
   meta.className = 'meta';
 
-  bubble.append(reasoning, memory, answer, meta);
+  bubble.append(route, reasoning, memory, answer, meta);
   messages.appendChild(bubble);
   messages.scrollTop = messages.scrollHeight;
 
-  return { bubble, reasoning, reasoningBody, memory, memoryBody, answer, meta, reasoningText: '', answerText: '', memories: [], stats: null };
+  return { bubble, route, reasoning, reasoningBody, memory, memoryBody, answer, meta, reasoningText: '', answerText: '', routeInfo: null, memories: [], stats: null };
+}
+
+function renderRoute(assistant) {
+  if (!assistant.route) return;
+
+  assistant.routeInfo = assistant.route;
+  assistant.route.hidden = false;
+  const parts = [
+    `${assistant.route.effort} mode`,
+    assistant.route.think ? 'thinking on' : 'thinking off',
+    assistant.route.useMemory ? 'memory on' : 'memory off',
+    assistant.route.useTools ? 'tools on' : 'tools off'
+  ];
+  assistant.route.textContent = parts.join(' | ');
+  assistant.route.title = assistant.route.reason ?? '';
 }
 
 function renderUsedMemories(assistant) {

@@ -252,10 +252,14 @@ app.MapPost("/api/chat", async (ChatRequest request, OllamaClient ollama, LocalT
         return Results.BadRequest(new ErrorResponse("Message is required."));
     }
 
-    var relevantMemories = await memory.SearchAsync(request.Message, request.MemoryLimit ?? 6, minScore: 0.15, cancellationToken: cancellationToken);
+    var route = ResolveReasoningRoute(request);
+    var activeTools = route.UseTools ? tools.GetTools() : [];
+    var relevantMemories = route.UseMemory
+        ? await memory.SearchAsync(request.Message, route.MemoryLimit, minScore: 0.15, cancellationToken: cancellationToken)
+        : [];
     var messages = new List<OllamaMessage>
     {
-        new("system", BuildSystemPrompt(request.SystemPrompt, tools.GetTools(), relevantMemories)),
+        new("system", BuildSystemPrompt(request.SystemPrompt, activeTools, relevantMemories, route)),
         new("user", request.Message)
     };
 
@@ -268,13 +272,13 @@ app.MapPost("/api/chat", async (ChatRequest request, OllamaClient ollama, LocalT
             Model: request.Model,
             Stream: false,
             Messages: messages,
-            Options: new OllamaOptions(Temperature: request.Temperature ?? 0.7, TopP: 0.95, TopK: 64),
-            Tools: tools.GetTools().Select(ToOllamaTool).ToList(),
-            Think: request.EnableThinking), cancellationToken);
+            Options: new OllamaOptions(Temperature: request.Temperature ?? route.Temperature, TopP: 0.95, TopK: 64),
+            Tools: route.UseTools ? activeTools.Select(ToOllamaTool).ToList() : null,
+            Think: route.Think), cancellationToken);
 
         var content = response.Message?.Content ?? string.Empty;
         var nativeToolCalls = response.Message?.ToolCalls?.Where(call => !string.IsNullOrWhiteSpace(call.Function?.Name)).ToList() ?? [];
-        var fallbackToolCall = nativeToolCalls.Count == 0 && TryParseToolCall(content, out var parsedToolCall) ? parsedToolCall : null;
+        var fallbackToolCall = route.UseTools && nativeToolCalls.Count == 0 && TryParseToolCall(content, out var parsedToolCall) ? parsedToolCall : null;
 
         if (nativeToolCalls.Count == 0 && fallbackToolCall is null)
         {
@@ -282,6 +286,7 @@ app.MapPost("/api/chat", async (ChatRequest request, OllamaClient ollama, LocalT
                 Response: content,
                 Reasoning: response.Message?.Thinking ?? response.Message?.Reasoning,
                 Stats: OllamaStats.FromChatResponse(response),
+                Route: route,
                 Memories: relevantMemories,
                 ToolResults: toolResults));
         }
@@ -309,6 +314,7 @@ app.MapPost("/api/chat", async (ChatRequest request, OllamaClient ollama, LocalT
         Response: response.Message?.Content ?? "Stopped after maximum tool-calling steps.",
         Reasoning: response.Message?.Thinking ?? response.Message?.Reasoning,
         Stats: OllamaStats.FromChatResponse(response),
+        Route: route,
         Memories: relevantMemories,
         ToolResults: toolResults));
 });
@@ -329,12 +335,18 @@ app.MapPost("/api/chat/stream", async (ChatRequest request, HttpResponse httpRes
         return;
     }
 
-    var relevantMemories = await memory.SearchAsync(request.Message, request.MemoryLimit ?? 6, minScore: 0.15, cancellationToken: cancellationToken);
+    var route = ResolveReasoningRoute(request);
+    var activeTools = route.UseTools ? tools.GetTools() : [];
+    await WriteStreamEventAsync(httpResponse, new StreamEvent("route", Route: route), cancellationToken);
+
+    var relevantMemories = route.UseMemory
+        ? await memory.SearchAsync(request.Message, route.MemoryLimit, minScore: 0.15, cancellationToken: cancellationToken)
+        : [];
     await WriteStreamEventAsync(httpResponse, new StreamEvent("memory", Memories: relevantMemories), cancellationToken);
 
     var messages = new List<OllamaMessage>
     {
-        new("system", BuildSystemPrompt(request.SystemPrompt, tools.GetTools(), relevantMemories)),
+        new("system", BuildSystemPrompt(request.SystemPrompt, activeTools, relevantMemories, route)),
         new("user", request.Message)
     };
 
@@ -346,9 +358,9 @@ app.MapPost("/api/chat/stream", async (ChatRequest request, HttpResponse httpRes
             Model: request.Model,
             Stream: true,
             Messages: messages,
-            Options: new OllamaOptions(Temperature: request.Temperature ?? 0.7, TopP: 0.95, TopK: 64),
-            Tools: tools.GetTools().Select(ToOllamaTool).ToList(),
-            Think: request.EnableThinking), async chunk =>
+            Options: new OllamaOptions(Temperature: request.Temperature ?? route.Temperature, TopP: 0.95, TopK: 64),
+            Tools: route.UseTools ? activeTools.Select(ToOllamaTool).ToList() : null,
+            Think: route.Think), async chunk =>
             {
                 if (!string.IsNullOrEmpty(chunk.Message?.Thinking))
                 {
@@ -370,7 +382,7 @@ app.MapPost("/api/chat/stream", async (ChatRequest request, HttpResponse httpRes
 
         var content = response.Message?.Content ?? string.Empty;
         var nativeToolCalls = response.Message?.ToolCalls?.Where(call => !string.IsNullOrWhiteSpace(call.Function?.Name)).ToList() ?? [];
-        var fallbackToolCall = nativeToolCalls.Count == 0 && TryParseToolCall(content, out var parsedToolCall) ? parsedToolCall : null;
+        var fallbackToolCall = route.UseTools && nativeToolCalls.Count == 0 && TryParseToolCall(content, out var parsedToolCall) ? parsedToolCall : null;
 
         if (nativeToolCalls.Count == 0 && fallbackToolCall is null)
         {
@@ -429,12 +441,74 @@ app.MapPost("/api/invoice", async (DocumentActionRequest request, DocumentProces
 
 app.Run();
 
-static string BuildSystemPrompt(string? systemPrompt, IReadOnlyList<LocalTool> tools, IReadOnlyList<MemorySearchResult> memories)
+static ReasoningRoute ResolveReasoningRoute(ChatRequest request)
+{
+    if (!request.EnableThinking && string.IsNullOrWhiteSpace(request.ReasoningMode))
+    {
+        return BuildRoute("fast", "Legacy reasoning toggle is off.", think: false, useMemory: false, useTools: false, memoryLimit: 0, temperature: 0.75);
+    }
+
+    var requested = string.IsNullOrWhiteSpace(request.ReasoningMode) ? "auto" : request.ReasoningMode.Trim().ToLowerInvariant();
+
+    return requested switch
+    {
+        "fast" or "off" or "none" => BuildRoute("fast", "User forced fast mode.", think: false, useMemory: false, useTools: false, memoryLimit: 0, temperature: 0.75),
+        "deep" or "high" => BuildRoute("deep", "User forced deep reasoning.", think: true, useMemory: true, useTools: true, memoryLimit: request.MemoryLimit ?? 8, temperature: 0.55),
+        "balanced" or "normal" => BuildRoute("balanced", "User forced balanced reasoning.", think: true, useMemory: true, useTools: true, memoryLimit: request.MemoryLimit ?? 5, temperature: 0.65),
+        _ => ClassifyReasoningEffort(request.Message, request.MemoryLimit)
+    };
+}
+
+static ReasoningRoute ClassifyReasoningEffort(string message, int? requestedMemoryLimit)
+{
+    var text = message.Trim();
+    var lower = text.ToLowerInvariant();
+    var wordCount = text.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Length;
+    var casualPatterns = new[]
+    {
+        "hi", "hello", "hey", "yo", "sup", "thanks", "thank you", "ok", "okay", "cool", "nice",
+        "how are you", "how's it going", "hows it going", "what's up", "whats up", "good morning", "good night"
+    };
+    var complexSignals = new[]
+    {
+        "analyze", "compare", "debug", "fix", "implement", "refactor", "architect", "design", "plan", "prove",
+        "explain why", "step by step", "tradeoff", "trade-off", "invoice", "ocr", "document", "pdf", "tool", "memory", "search",
+        "summarize", "extract", "calculate", "reason", "deep", "thorough"
+    };
+
+    var looksLikeCasualGreeting = casualPatterns.Any(pattern => lower.Contains(pattern))
+        || (lower.Contains("how") && (lower.Contains("going") || lower.Contains("goin")))
+        || (lower.Contains("what") && lower.Contains("up"));
+
+    if (wordCount <= 12 && text.Length <= 90 && looksLikeCasualGreeting)
+    {
+        return BuildRoute("fast", "Casual short message; skipping memory, tools, and reasoning for minimum latency.", think: false, useMemory: false, useTools: false, memoryLimit: 0, temperature: 0.82);
+    }
+
+    if (text.Length <= 55 && wordCount <= 8 && !text.Contains('?') && !complexSignals.Any(signal => lower.Contains(signal)))
+    {
+        return BuildRoute("fast", "Short low-risk turn; optimized for conversational speed.", think: false, useMemory: false, useTools: false, memoryLimit: 0, temperature: 0.82);
+    }
+
+    if (text.Length >= 260 || wordCount >= 45 || complexSignals.Any(signal => lower.Contains(signal)))
+    {
+        return BuildRoute("deep", "Complex or tool/document-like request; enabling memory, tools, and reasoning.", think: true, useMemory: true, useTools: true, memoryLimit: requestedMemoryLimit ?? 8, temperature: 0.55);
+    }
+
+    return BuildRoute("balanced", "Normal request; using memory and tools with moderate reasoning.", think: true, useMemory: true, useTools: true, memoryLimit: requestedMemoryLimit ?? 5, temperature: 0.65);
+}
+
+static ReasoningRoute BuildRoute(string effort, string reason, bool think, bool useMemory, bool useTools, int memoryLimit, double temperature) =>
+    new(effort, reason, think, useMemory, useTools, Math.Clamp(memoryLimit, 0, 12), temperature);
+
+static string BuildSystemPrompt(string? systemPrompt, IReadOnlyList<LocalTool> tools, IReadOnlyList<MemorySearchResult> memories, ReasoningRoute route)
 {
     var basePrompt = string.IsNullOrWhiteSpace(systemPrompt)
         ? "You are LLLM, a concise local-only assistant running against Ollama."
         : systemPrompt;
-    var toolDescriptions = string.Join(Environment.NewLine, tools.Select(tool => $"- {tool.Name}: {tool.Description}. Arguments JSON schema: {tool.ParametersJsonSchema}"));
+    var toolDescriptions = tools.Count == 0
+        ? "No tools are enabled for this fast conversational turn."
+        : string.Join(Environment.NewLine, tools.Select(tool => $"- {tool.Name}: {tool.Description}. Arguments JSON schema: {tool.ParametersJsonSchema}"));
     var toolCallExample = "{\"tool\":\"tool_name\",\"arguments\":{}}";
     var memoryBlock = memories.Count == 0
         ? "No relevant local memories were retrieved for this turn."
@@ -454,6 +528,11 @@ Memory instructions:
 - Treat local memory as potentially useful context, not absolute truth.
 - If you use a memory, naturally mention the source when helpful.
 - Do not expose raw memory IDs unless the user asks.
+
+Reasoning route:
+- Effort: {route.Effort}.
+- Reason: {route.Reason}
+- If effort is fast, answer like a relaxed, friendly local assistant: brief, warm, and conversational. Do not mention being an AI system, functioning status, routing, tools, or memory unless directly asked.
 
 Available tools:
 {toolDescriptions}
@@ -1557,9 +1636,10 @@ public sealed record ErrorResponse(string Error);
 public sealed record ModelActionRequest(string Model, string? KeepAlive = null);
 public sealed record OllamaStatusResponse(bool Healthy, bool ManagedProcessRunning, IReadOnlyList<LoadedOllamaModel> LoadedModels);
 public sealed record LoadedOllamaModel(string Name, long Size, string? Processor, int? ContextLength, DateTimeOffset? ExpiresAt);
-public sealed record StreamEvent(string Type, string? Text = null, ToolResult? ToolResult = null, OllamaStats? Stats = null, IReadOnlyList<MemorySearchResult>? Memories = null, string? Error = null);
-public sealed record ChatRequest(string Model, string Message, string? SystemPrompt, bool EnableThinking = true, double? Temperature = null, int? MemoryLimit = null);
-public sealed record ChatResponse(string Response, string? Reasoning, OllamaStats? Stats, IReadOnlyList<MemorySearchResult> Memories, IReadOnlyList<ToolResult> ToolResults);
+public sealed record StreamEvent(string Type, string? Text = null, ToolResult? ToolResult = null, OllamaStats? Stats = null, ReasoningRoute? Route = null, IReadOnlyList<MemorySearchResult>? Memories = null, string? Error = null);
+public sealed record ChatRequest(string Model, string Message, string? SystemPrompt, bool EnableThinking = true, string? ReasoningMode = null, double? Temperature = null, int? MemoryLimit = null);
+public sealed record ChatResponse(string Response, string? Reasoning, OllamaStats? Stats, ReasoningRoute Route, IReadOnlyList<MemorySearchResult> Memories, IReadOnlyList<ToolResult> ToolResults);
+public sealed record ReasoningRoute(string Effort, string Reason, bool Think, bool UseMemory, bool UseTools, int MemoryLimit, double Temperature);
 public sealed record MemoryCreateRequest(string Content, string? Title = null);
 public sealed record MemoryEntry(string Id, string Source, string? SourceId, string Title, string Content, string? MetadataJson, IReadOnlyList<double> Embedding, string EmbeddingModel, DateTimeOffset CreatedAt);
 public sealed record MemorySearchResult(string Id, string Source, string? SourceId, string Title, string Content, DateTimeOffset CreatedAt, double? Score);
