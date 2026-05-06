@@ -1,0 +1,18 @@
+{
+  "name": "LLLM Local Assistant",
+  "short_name": "LLLM",
+  "description": "Local-only Ollama workbench for chat, tools, OCR, invoices, and voice input.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#07080b",
+  "theme_color": "#07080b",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+using Microsoft.Data.Sqlite;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -28,11 +29,15 @@ builder.Services.AddHttpClient("ollama", (serviceProvider, client) =>
 
 builder.Services.AddSingleton<AppState>();
 builder.Services.AddSingleton<OllamaClient>();
+builder.Services.AddSingleton<MemoryStore>();
+builder.Services.AddSingleton<OllamaManager>();
 builder.Services.AddSingleton<DocumentProcessor>();
 builder.Services.AddSingleton<SpeechTranscriber>();
 builder.Services.AddSingleton<LocalToolRegistry>();
 
 var app = builder.Build();
+
+await app.Services.GetRequiredService<MemoryStore>().InitializeAsync(CancellationToken.None);
 
 app.UseDefaultFiles();
 app.UseStaticFiles();
@@ -49,9 +54,101 @@ app.MapGet("/api/models", async (OllamaClient ollama, CancellationToken cancella
     return Results.Ok(models.OrderBy(model => model.Name, StringComparer.OrdinalIgnoreCase));
 });
 
+app.MapGet("/api/ollama/status", async (OllamaClient ollama, OllamaManager manager, CancellationToken cancellationToken) =>
+{
+    var healthy = await ollama.IsHealthyAsync(cancellationToken);
+    var loadedModels = healthy ? await ollama.GetLoadedModelsAsync(cancellationToken) : [];
+    return Results.Ok(new OllamaStatusResponse(healthy, manager.IsManagedProcessRunning, loadedModels));
+});
+
+app.MapPost("/api/ollama/start", async (OllamaManager manager, OllamaClient ollama, CancellationToken cancellationToken) =>
+{
+    await manager.StartAsync(cancellationToken);
+    var healthy = await ollama.WaitUntilHealthyAsync(TimeSpan.FromSeconds(20), cancellationToken);
+    return Results.Ok(new { healthy });
+});
+
+app.MapPost("/api/ollama/stop", (OllamaManager manager) =>
+{
+    manager.StopManagedProcess();
+    return Results.Ok(new { stopped = true });
+});
+
+app.MapPost("/api/ollama/warm", async (ModelActionRequest request, OllamaClient ollama, CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Model))
+    {
+        return Results.BadRequest(new ErrorResponse("Model is required."));
+    }
+
+    var result = await ollama.GenerateAsync(new OllamaGenerateRequest(
+        Model: request.Model,
+        Prompt: "Respond with OK.",
+        Stream: false,
+        Images: null,
+        Options: new OllamaOptions(Temperature: 0.0, TopP: 0.9, TopK: 40),
+        KeepAlive: request.KeepAlive ?? "10m"), cancellationToken);
+    return Results.Ok(new { response = result.Response.Trim(), stats = OllamaStats.FromGenerateResponse(result) });
+});
+
+app.MapPost("/api/ollama/unload", async (ModelActionRequest request, OllamaClient ollama, CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Model))
+    {
+        return Results.BadRequest(new ErrorResponse("Model is required."));
+    }
+
+    await ollama.UnloadModelAsync(request.Model, cancellationToken);
+    return Results.Ok(new { unloaded = request.Model });
+});
+
+app.MapPost("/api/ollama/pull", async (ModelActionRequest request, OllamaClient ollama, CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Model))
+    {
+        return Results.BadRequest(new ErrorResponse("Model is required."));
+    }
+
+    await ollama.PullModelAsync(request.Model, cancellationToken);
+    return Results.Ok(new { pulled = request.Model });
+});
+
+app.MapGet("/api/memory/search", async (string q, int? limit, MemoryStore memory, CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(q))
+    {
+        return Results.BadRequest(new ErrorResponse("Search query is required."));
+    }
+
+    var results = await memory.SearchAsync(q, limit ?? 8, cancellationToken: cancellationToken);
+    return Results.Ok(results);
+});
+
+app.MapGet("/api/memory/recent", (int? limit, MemoryStore memory) =>
+{
+    return Results.Ok(memory.GetRecent(limit ?? 12));
+});
+
+app.MapPost("/api/memory", async (MemoryCreateRequest request, MemoryStore memory, CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Content))
+    {
+        return Results.BadRequest(new ErrorResponse("Memory content is required."));
+    }
+
+    var item = await memory.RememberAsync("manual", null, request.Title ?? "Manual memory", request.Content, null, cancellationToken);
+    return Results.Ok(item);
+});
+
+app.MapDelete("/api/memory/{id}", async (string id, MemoryStore memory, CancellationToken cancellationToken) =>
+{
+    await memory.DeleteAsync(id, cancellationToken);
+    return Results.Ok(new { deleted = id });
+});
+
 app.MapGet("/api/documents/current", (AppState state) => Results.Ok(state.CurrentDocument));
 
-app.MapPost("/api/documents", async (HttpRequest request, AppState state, IWebHostEnvironment environment, CancellationToken cancellationToken) =>
+app.MapPost("/api/documents", async (HttpRequest request, AppState state, IWebHostEnvironment environment, DocumentProcessor processor, MemoryStore memory, CancellationToken cancellationToken) =>
 {
     if (!request.HasFormContentType)
     {
@@ -60,6 +157,7 @@ app.MapPost("/api/documents", async (HttpRequest request, AppState state, IWebHo
 
     var form = await request.ReadFormAsync(cancellationToken);
     var file = form.Files.GetFile("file");
+    var model = form.TryGetValue("model", out var modelValues) ? modelValues.ToString() : string.Empty;
 
     if (file is null || file.Length == 0)
     {
@@ -87,7 +185,33 @@ app.MapPost("/api/documents", async (HttpRequest request, AppState state, IWebHo
         UploadedAt: DateTimeOffset.UtcNow);
 
     state.CurrentDocument = document;
-    return Results.Ok(document);
+    IReadOnlyList<MemorySearchResult> indexed = [];
+    string? indexMethod = null;
+    double? indexDurationMs = null;
+
+    if (!string.IsNullOrWhiteSpace(model))
+    {
+        var result = await processor.ExtractIndexableTextAsync(document, model, 3, cancellationToken);
+        indexed = await memory.IndexDocumentAsync(document, result.Text, result.Method, cancellationToken);
+        indexMethod = result.Method;
+        indexDurationMs = result.DurationMs;
+    }
+
+    return Results.Ok(new DocumentUploadResponse(document, indexed.Count, indexMethod, indexDurationMs));
+});
+
+app.MapPost("/api/documents/current/index", async (DocumentIndexRequest request, AppState state, DocumentProcessor processor, MemoryStore memory, CancellationToken cancellationToken) =>
+{
+    var document = state.CurrentDocument;
+
+    if (document is null)
+    {
+        return Results.BadRequest(new ErrorResponse("Upload a document first."));
+    }
+
+    var result = await processor.ExtractIndexableTextAsync(document, request.Model, request.Pages ?? 3, cancellationToken);
+    var indexed = await memory.IndexDocumentAsync(document, result.Text, result.Method, cancellationToken);
+    return Results.Ok(new DocumentIndexResponse(document, indexed.Count, result.Method, indexed, result.DurationMs));
 });
 
 app.MapPost("/api/transcribe", async (HttpRequest request, SpeechTranscriber transcriber, CancellationToken cancellationToken) =>
@@ -116,7 +240,7 @@ app.MapPost("/api/transcribe", async (HttpRequest request, SpeechTranscriber tra
     }
 });
 
-app.MapPost("/api/chat", async (ChatRequest request, OllamaClient ollama, LocalToolRegistry tools, AppState state, CancellationToken cancellationToken) =>
+app.MapPost("/api/chat", async (ChatRequest request, OllamaClient ollama, LocalToolRegistry tools, MemoryStore memory, CancellationToken cancellationToken) =>
 {
     if (string.IsNullOrWhiteSpace(request.Model))
     {
@@ -128,9 +252,10 @@ app.MapPost("/api/chat", async (ChatRequest request, OllamaClient ollama, LocalT
         return Results.BadRequest(new ErrorResponse("Message is required."));
     }
 
+    var relevantMemories = await memory.SearchAsync(request.Message, request.MemoryLimit ?? 6, minScore: 0.15, cancellationToken: cancellationToken);
     var messages = new List<OllamaMessage>
     {
-        new("system", BuildSystemPrompt(request.SystemPrompt, tools.GetTools())),
+        new("system", BuildSystemPrompt(request.SystemPrompt, tools.GetTools(), relevantMemories)),
         new("user", request.Message)
     };
 
@@ -157,6 +282,7 @@ app.MapPost("/api/chat", async (ChatRequest request, OllamaClient ollama, LocalT
                 Response: content,
                 Reasoning: response.Message?.Thinking ?? response.Message?.Reasoning,
                 Stats: OllamaStats.FromChatResponse(response),
+                Memories: relevantMemories,
                 ToolResults: toolResults));
         }
 
@@ -183,10 +309,11 @@ app.MapPost("/api/chat", async (ChatRequest request, OllamaClient ollama, LocalT
         Response: response.Message?.Content ?? "Stopped after maximum tool-calling steps.",
         Reasoning: response.Message?.Thinking ?? response.Message?.Reasoning,
         Stats: OllamaStats.FromChatResponse(response),
+        Memories: relevantMemories,
         ToolResults: toolResults));
 });
 
-app.MapPost("/api/chat/stream", async (ChatRequest request, HttpResponse httpResponse, OllamaClient ollama, LocalToolRegistry tools, CancellationToken cancellationToken) =>
+app.MapPost("/api/chat/stream", async (ChatRequest request, HttpResponse httpResponse, OllamaClient ollama, LocalToolRegistry tools, MemoryStore memory, CancellationToken cancellationToken) =>
 {
     httpResponse.ContentType = "application/x-ndjson";
 
@@ -202,9 +329,12 @@ app.MapPost("/api/chat/stream", async (ChatRequest request, HttpResponse httpRes
         return;
     }
 
+    var relevantMemories = await memory.SearchAsync(request.Message, request.MemoryLimit ?? 6, minScore: 0.15, cancellationToken: cancellationToken);
+    await WriteStreamEventAsync(httpResponse, new StreamEvent("memory", Memories: relevantMemories), cancellationToken);
+
     var messages = new List<OllamaMessage>
     {
-        new("system", BuildSystemPrompt(request.SystemPrompt, tools.GetTools())),
+        new("system", BuildSystemPrompt(request.SystemPrompt, tools.GetTools(), relevantMemories)),
         new("user", request.Message)
     };
 
@@ -299,13 +429,16 @@ app.MapPost("/api/invoice", async (DocumentActionRequest request, DocumentProces
 
 app.Run();
 
-static string BuildSystemPrompt(string? systemPrompt, IReadOnlyList<LocalTool> tools)
+static string BuildSystemPrompt(string? systemPrompt, IReadOnlyList<LocalTool> tools, IReadOnlyList<MemorySearchResult> memories)
 {
     var basePrompt = string.IsNullOrWhiteSpace(systemPrompt)
         ? "You are LLLM, a concise local-only assistant running against Ollama."
         : systemPrompt;
     var toolDescriptions = string.Join(Environment.NewLine, tools.Select(tool => $"- {tool.Name}: {tool.Description}. Arguments JSON schema: {tool.ParametersJsonSchema}"));
     var toolCallExample = "{\"tool\":\"tool_name\",\"arguments\":{}}";
+    var memoryBlock = memories.Count == 0
+        ? "No relevant local memories were retrieved for this turn."
+        : string.Join(Environment.NewLine, memories.Select((memory, index) => $"[{index + 1}] {memory.Source}: {memory.Title}\n{memory.Content}"));
 
     return $"""
 {basePrompt}
@@ -313,6 +446,14 @@ static string BuildSystemPrompt(string? systemPrompt, IReadOnlyList<LocalTool> t
 Local-only constraints:
 - Use local Ollama models and local tools only.
 - Do not suggest cloud AI services unless the user explicitly asks.
+
+Relevant local memory and documents:
+{memoryBlock}
+
+Memory instructions:
+- Treat local memory as potentially useful context, not absolute truth.
+- If you use a memory, naturally mention the source when helpful.
+- Do not expose raw memory IDs unless the user asks.
 
 Available tools:
 {toolDescriptions}
@@ -410,14 +551,13 @@ public sealed class OllamaClient(IHttpClientFactory httpClientFactory)
         return response.Models;
     }
 
-    public async Task<string> GetLoadedModelsAsync(CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<LoadedOllamaModel>> GetLoadedModelsAsync(CancellationToken cancellationToken)
     {
         using var response = await httpClientFactory.CreateClient("ollama").GetAsync("/api/ps", cancellationToken);
 
         if (!response.IsSuccessStatusCode)
         {
-            var error = await response.Content.ReadAsStringAsync(cancellationToken);
-            return $"Ollama /api/ps returned {(int)response.StatusCode}: {error}";
+            return [];
         }
 
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
@@ -425,22 +565,67 @@ public sealed class OllamaClient(IHttpClientFactory httpClientFactory)
 
         if (!document.RootElement.TryGetProperty("models", out var models) || models.GetArrayLength() == 0)
         {
-            return "No Ollama models are currently loaded in memory.";
+            return [];
         }
 
-        var lines = new List<string>();
+        var loadedModels = new List<LoadedOllamaModel>();
 
         foreach (var model in models.EnumerateArray())
         {
             var name = model.TryGetProperty("name", out var nameElement) ? nameElement.GetString() : "unknown";
-            var size = model.TryGetProperty("size", out var sizeElement) && sizeElement.TryGetInt64(out var sizeBytes)
-                ? $" {Math.Round(sizeBytes / 1024d / 1024d / 1024d, 2)} GB"
-                : string.Empty;
-            var until = model.TryGetProperty("expires_at", out var expiresElement) ? $" until {expiresElement.GetString()}" : string.Empty;
-            lines.Add($"{name}{size}{until}");
+            var size = model.TryGetProperty("size", out var sizeElement) && sizeElement.TryGetInt64(out var sizeBytes) ? sizeBytes : 0;
+            var processor = model.TryGetProperty("processor", out var processorElement) ? processorElement.GetString() : null;
+            var context = model.TryGetProperty("context_length", out var contextElement) && contextElement.TryGetInt32(out var contextValue) ? contextValue : (int?)null;
+            var expiresAt = model.TryGetProperty("expires_at", out var expiresElement) && expiresElement.TryGetDateTimeOffset(out var expiresValue) ? expiresValue : (DateTimeOffset?)null;
+            loadedModels.Add(new LoadedOllamaModel(name ?? "unknown", size, processor, context, expiresAt));
         }
 
-        return string.Join(Environment.NewLine, lines);
+        return loadedModels;
+    }
+
+    public async Task<bool> WaitUntilHealthyAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var deadline = DateTimeOffset.UtcNow.Add(timeout);
+
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (await IsHealthyAsync(cancellationToken))
+            {
+                return true;
+            }
+
+            await Task.Delay(500, cancellationToken);
+        }
+
+        return false;
+    }
+
+    public async Task PullModelAsync(string model, CancellationToken cancellationToken)
+    {
+        using var response = await httpClientFactory.CreateClient("ollama").PostAsJsonAsync("/api/pull", new OllamaPullRequest(model, false), JsonDefaults.Options, cancellationToken);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var error = await response.Content.ReadAsStringAsync(cancellationToken);
+            throw new InvalidOperationException($"Ollama pull returned {(int)response.StatusCode}: {error}");
+        }
+    }
+
+    public async Task UnloadModelAsync(string model, CancellationToken cancellationToken)
+    {
+        using var response = await httpClientFactory.CreateClient("ollama").PostAsJsonAsync("/api/generate", new OllamaGenerateRequest(
+            Model: model,
+            Prompt: string.Empty,
+            Stream: false,
+            Images: null,
+            Options: new OllamaOptions(Temperature: 0.0, TopP: 0.9, TopK: 40),
+            KeepAlive: "0"), JsonDefaults.Options, cancellationToken);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var error = await response.Content.ReadAsStringAsync(cancellationToken);
+            throw new InvalidOperationException($"Ollama unload returned {(int)response.StatusCode}: {error}");
+        }
     }
 
     public async Task<OllamaChatResponse> ChatAsync(OllamaChatRequest request, CancellationToken cancellationToken)
@@ -540,6 +725,355 @@ public sealed class OllamaClient(IHttpClientFactory httpClientFactory)
         return await response.Content.ReadFromJsonAsync<OllamaGenerateResponse>(JsonDefaults.Options, cancellationToken)
             ?? throw new InvalidOperationException("Ollama returned an empty generate response.");
     }
+
+    public async Task<IReadOnlyList<double>> EmbedAsync(string model, string prompt, CancellationToken cancellationToken)
+    {
+        using var response = await httpClientFactory.CreateClient("ollama").PostAsJsonAsync("/api/embeddings", new OllamaEmbeddingRequest(model, prompt), JsonDefaults.Options, cancellationToken);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var error = await response.Content.ReadAsStringAsync(cancellationToken);
+            throw new InvalidOperationException($"Ollama embedding returned {(int)response.StatusCode}: {error}");
+        }
+
+        var result = await response.Content.ReadFromJsonAsync<OllamaEmbeddingResponse>(JsonDefaults.Options, cancellationToken)
+            ?? throw new InvalidOperationException("Ollama returned an empty embedding response.");
+        return result.Embedding;
+    }
+}
+
+public sealed class MemoryStore(OllamaClient ollama, Microsoft.Extensions.Options.IOptions<LocalAiOptions> options, IWebHostEnvironment environment)
+{
+    private readonly MemoryOptions _options = options.Value.Memory;
+    private readonly List<MemoryEntry> _entries = [];
+    private readonly SemaphoreSlim _gate = new(1, 1);
+    private string _databasePath = string.Empty;
+    private string _connectionString = string.Empty;
+
+    public async Task InitializeAsync(CancellationToken cancellationToken)
+    {
+        var directory = Path.Combine(environment.ContentRootPath, _options.Directory);
+        Directory.CreateDirectory(directory);
+        _databasePath = Path.Combine(directory, _options.DatabaseFileName);
+        _connectionString = new SqliteConnectionStringBuilder { DataSource = _databasePath }.ToString();
+
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+            create table if not exists memories (
+                id text primary key,
+                source text not null,
+                source_id text null,
+                title text not null,
+                content text not null,
+                metadata_json text null,
+                embedding_json text not null,
+                embedding_model text not null,
+                created_at text not null
+            );
+            create index if not exists idx_memories_created_at on memories(created_at);
+            create index if not exists idx_memories_source_id on memories(source_id);
+            """;
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await LoadCacheAsync(connection, cancellationToken);
+    }
+
+    public IReadOnlyList<MemorySearchResult> GetRecent(int limit)
+    {
+        lock (_entries)
+        {
+            return _entries
+                .OrderByDescending(entry => entry.CreatedAt)
+                .Take(Math.Clamp(limit, 1, 50))
+                .Select(entry => ToSearchResult(entry, null))
+                .ToList();
+        }
+    }
+
+    public async Task<MemorySearchResult> RememberAsync(string source, string? sourceId, string title, string content, string? metadataJson, CancellationToken cancellationToken)
+    {
+        var chunks = ChunkText(content, _options.MaxChunkCharacters, _options.ChunkOverlapCharacters);
+        var text = chunks.Count == 0 ? content.Trim() : chunks[0];
+        return await StoreChunkAsync(source, sourceId, title, text, metadataJson, cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<MemorySearchResult>> IndexDocumentAsync(UploadedDocument document, string text, string method, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return [];
+        }
+
+        var chunks = ChunkText(text, _options.MaxChunkCharacters, _options.ChunkOverlapCharacters).Take(_options.MaxDocumentChunks).ToList();
+        var results = new List<MemorySearchResult>();
+        var metadata = JsonSerializer.Serialize(new { document.Id, document.OriginalName, document.Kind, method }, JsonDefaults.Options);
+
+        for (var index = 0; index < chunks.Count; index++)
+        {
+            var title = $"{document.OriginalName} chunk {index + 1}/{chunks.Count}";
+            results.Add(await StoreChunkAsync("document", document.Id, title, chunks[index], metadata, cancellationToken));
+        }
+
+        return results;
+    }
+
+    public async Task<IReadOnlyList<MemorySearchResult>> SearchAsync(string query, int limit, double minScore = 0.0, CancellationToken cancellationToken = default)
+    {
+        if (!_options.Enabled)
+        {
+            return [];
+        }
+
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            return [];
+        }
+
+        var queryEmbedding = await ollama.EmbedAsync(_options.EmbeddingModel, query, cancellationToken);
+        List<MemoryEntry> snapshot;
+
+        lock (_entries)
+        {
+            snapshot = _entries.ToList();
+        }
+
+        return snapshot
+            .Select(entry => ToSearchResult(entry, CosineSimilarity(queryEmbedding, entry.Embedding)))
+            .Where(result => result.Score is null || result.Score >= minScore)
+            .OrderByDescending(result => result.Score ?? 0)
+            .ThenByDescending(result => result.CreatedAt)
+            .Take(Math.Clamp(limit, 1, 25))
+            .ToList();
+    }
+
+    public async Task DeleteAsync(string id, CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = new SqliteConnection(_connectionString);
+            await connection.OpenAsync(cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = "delete from memories where id = $id";
+            command.Parameters.AddWithValue("$id", id);
+            await command.ExecuteNonQueryAsync(cancellationToken);
+
+            lock (_entries)
+            {
+                _entries.RemoveAll(entry => entry.Id == id);
+            }
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    private async Task<MemorySearchResult> StoreChunkAsync(string source, string? sourceId, string title, string content, string? metadataJson, CancellationToken cancellationToken)
+    {
+        if (!_options.Enabled)
+        {
+            throw new InvalidOperationException("Local memory is disabled. Set LocalAi:Memory:Enabled=true.");
+        }
+
+        var normalizedContent = content.Trim();
+        var embedding = await ollama.EmbedAsync(_options.EmbeddingModel, normalizedContent, cancellationToken);
+        var entry = new MemoryEntry(
+            Id: Guid.NewGuid().ToString("N"),
+            Source: source,
+            SourceId: sourceId,
+            Title: title.Trim(),
+            Content: normalizedContent,
+            MetadataJson: metadataJson,
+            Embedding: embedding,
+            EmbeddingModel: _options.EmbeddingModel,
+            CreatedAt: DateTimeOffset.UtcNow);
+
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = new SqliteConnection(_connectionString);
+            await connection.OpenAsync(cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+            insert into memories (id, source, source_id, title, content, metadata_json, embedding_json, embedding_model, created_at)
+            values ($id, $source, $sourceId, $title, $content, $metadataJson, $embeddingJson, $embeddingModel, $createdAt)
+            """;
+            command.Parameters.AddWithValue("$id", entry.Id);
+            command.Parameters.AddWithValue("$source", entry.Source);
+            command.Parameters.AddWithValue("$sourceId", (object?)entry.SourceId ?? DBNull.Value);
+            command.Parameters.AddWithValue("$title", entry.Title);
+            command.Parameters.AddWithValue("$content", entry.Content);
+            command.Parameters.AddWithValue("$metadataJson", (object?)entry.MetadataJson ?? DBNull.Value);
+            command.Parameters.AddWithValue("$embeddingJson", JsonSerializer.Serialize(entry.Embedding, JsonDefaults.Options));
+            command.Parameters.AddWithValue("$embeddingModel", entry.EmbeddingModel);
+            command.Parameters.AddWithValue("$createdAt", entry.CreatedAt.ToString("O"));
+            await command.ExecuteNonQueryAsync(cancellationToken);
+
+            lock (_entries)
+            {
+                _entries.Add(entry);
+            }
+        }
+        finally
+        {
+            _gate.Release();
+        }
+
+        return ToSearchResult(entry, null);
+    }
+
+    private async Task LoadCacheAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        var loaded = new List<MemoryEntry>();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "select id, source, source_id, title, content, metadata_json, embedding_json, embedding_model, created_at from memories order by created_at asc";
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var embedding = JsonSerializer.Deserialize<IReadOnlyList<double>>(reader.GetString(6), JsonDefaults.Options) ?? [];
+            var createdAt = DateTimeOffset.TryParse(reader.GetString(8), out var parsed) ? parsed : DateTimeOffset.UtcNow;
+            loaded.Add(new MemoryEntry(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.IsDBNull(2) ? null : reader.GetString(2),
+                reader.GetString(3),
+                reader.GetString(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                embedding,
+                reader.GetString(7),
+                createdAt));
+        }
+
+        lock (_entries)
+        {
+            _entries.Clear();
+            _entries.AddRange(loaded);
+        }
+    }
+
+    private static IReadOnlyList<string> ChunkText(string text, int maxCharacters, int overlapCharacters)
+    {
+        var normalized = text.Replace("\r\n", "\n").Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return [];
+        }
+
+        var chunks = new List<string>();
+        var start = 0;
+        maxCharacters = Math.Max(500, maxCharacters);
+        overlapCharacters = Math.Clamp(overlapCharacters, 0, maxCharacters / 2);
+
+        while (start < normalized.Length)
+        {
+            var length = Math.Min(maxCharacters, normalized.Length - start);
+            var end = start + length;
+
+            if (end < normalized.Length)
+            {
+                var breakAt = normalized.LastIndexOf('\n', end - 1, Math.Min(length, 500));
+                if (breakAt <= start)
+                {
+                    breakAt = normalized.LastIndexOf('.', end - 1, Math.Min(length, 500));
+                }
+
+                if (breakAt > start + 300)
+                {
+                    end = breakAt + 1;
+                }
+            }
+
+            var chunk = normalized[start..end].Trim();
+            if (chunk.Length > 0)
+            {
+                chunks.Add(chunk);
+            }
+
+            start = Math.Max(end - overlapCharacters, end == normalized.Length ? normalized.Length : start + 1);
+        }
+
+        return chunks;
+    }
+
+    private static double CosineSimilarity(IReadOnlyList<double> left, IReadOnlyList<double> right)
+    {
+        var length = Math.Min(left.Count, right.Count);
+        if (length == 0)
+        {
+            return 0;
+        }
+
+        double dot = 0;
+        double leftMagnitude = 0;
+        double rightMagnitude = 0;
+
+        for (var index = 0; index < length; index++)
+        {
+            dot += left[index] * right[index];
+            leftMagnitude += left[index] * left[index];
+            rightMagnitude += right[index] * right[index];
+        }
+
+        return leftMagnitude == 0 || rightMagnitude == 0 ? 0 : dot / (Math.Sqrt(leftMagnitude) * Math.Sqrt(rightMagnitude));
+    }
+
+    private static MemorySearchResult ToSearchResult(MemoryEntry entry, double? score) => new(entry.Id, entry.Source, entry.SourceId, entry.Title, entry.Content, entry.CreatedAt, score);
+}
+
+public sealed class OllamaManager(Microsoft.Extensions.Options.IOptions<LocalAiOptions> options, IWebHostEnvironment environment)
+{
+    private readonly LocalAiOptions _options = options.Value;
+    private readonly object _gate = new();
+    private Process? _managedProcess;
+
+    public bool IsManagedProcessRunning => _managedProcess is { HasExited: false };
+
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            if (IsManagedProcessRunning)
+            {
+                return Task.CompletedTask;
+            }
+
+            _managedProcess = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = _options.OllamaExecutable,
+                    ArgumentList = { "serve" },
+                    WorkingDirectory = environment.ContentRootPath,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                }
+            };
+            _managedProcess.Start();
+            return Task.CompletedTask;
+        }
+    }
+
+    public void StopManagedProcess()
+    {
+        lock (_gate)
+        {
+            if (_managedProcess is { HasExited: false })
+            {
+                _managedProcess.Kill(entireProcessTree: true);
+            }
+
+            _managedProcess?.Dispose();
+            _managedProcess = null;
+        }
+    }
 }
 
 public sealed class LocalToolRegistry(AppState state, DocumentProcessor processor)
@@ -615,7 +1149,9 @@ public sealed class LocalToolRegistry(AppState state, DocumentProcessor processo
     private async Task<string> ShowLoadedModelsAsync(CancellationToken cancellationToken)
     {
         var loaded = await processor.GetLoadedModelsAsync(cancellationToken);
-        return string.IsNullOrWhiteSpace(loaded) ? "No Ollama models are currently loaded in memory." : loaded;
+        return loaded.Count == 0
+            ? "No Ollama models are currently loaded in memory."
+            : string.Join(Environment.NewLine, loaded.Select(model => $"{model.Name} {Math.Round(model.Size / 1024d / 1024d / 1024d, 2)} GB until {model.ExpiresAt}"));
     }
 }
 
@@ -624,18 +1160,24 @@ public sealed class DocumentProcessor(OllamaClient ollama, IWebHostEnvironment e
     public async Task<IReadOnlyList<OllamaModel>> GetModelsAsync(CancellationToken cancellationToken) =>
         await ollama.GetModelsAsync(cancellationToken);
 
-    public async Task<string> GetLoadedModelsAsync(CancellationToken cancellationToken) =>
+    public async Task<IReadOnlyList<LoadedOllamaModel>> GetLoadedModelsAsync(CancellationToken cancellationToken) =>
         await ollama.GetLoadedModelsAsync(cancellationToken);
 
     public static string GetSupportedFileKind(string path)
     {
         var extension = Path.GetExtension(path).ToLowerInvariant();
 
+        if (string.IsNullOrWhiteSpace(extension))
+        {
+            return "text";
+        }
+
         return extension switch
         {
             ".pdf" => "pdf",
+            ".txt" or ".md" or ".csv" or ".json" or ".log" => "text",
             ".png" or ".jpg" or ".jpeg" or ".webp" or ".gif" or ".bmp" or ".tif" or ".tiff" => "image",
-            _ => throw new InvalidOperationException($"Unsupported file type '{extension}'. Use a PDF or image file.")
+            _ => throw new InvalidOperationException($"Unsupported file type '{extension}'. Use a PDF, image, or text file.")
         };
     }
 
@@ -676,6 +1218,28 @@ public sealed class DocumentProcessor(OllamaClient ollama, IWebHostEnvironment e
 
         stopwatch.Stop();
         return new DocumentProcessResponse(operation.ToString(), document, stopwatch.Elapsed.TotalMilliseconds, pageResults);
+    }
+
+    public async Task<DocumentIndexTextResponse> ExtractIndexableTextAsync(UploadedDocument document, string model, int pages, CancellationToken cancellationToken)
+    {
+        var stopwatch = Stopwatch.StartNew();
+
+        if (document.Kind == "text")
+        {
+            var rawText = await File.ReadAllTextAsync(document.Path, cancellationToken);
+            stopwatch.Stop();
+            return new DocumentIndexTextResponse(rawText, "text", stopwatch.Elapsed.TotalMilliseconds);
+        }
+
+        if (string.IsNullOrWhiteSpace(model))
+        {
+            throw new InvalidOperationException("A vision-capable model is required to index PDFs/images.");
+        }
+
+        var result = await ProcessAsync(document, model, DocumentOperation.Ocr, pages, cancellationToken);
+        stopwatch.Stop();
+        var text = string.Join("\n\n", result.Pages.Select(page => $"Page {page.Page}\n{page.Text}"));
+        return new DocumentIndexTextResponse(text, "ocr", stopwatch.Elapsed.TotalMilliseconds);
     }
 
     private async Task<IReadOnlyList<string>> PrepareImageInputsAsync(UploadedDocument document, int pageLimit, CancellationToken cancellationToken)
@@ -954,9 +1518,22 @@ public sealed class SpeechTranscriber(Microsoft.Extensions.Options.IOptions<Loca
 public sealed class LocalAiOptions
 {
     public string BaseUrl { get; init; } = "http://127.0.0.1:11434";
+    public string OllamaExecutable { get; init; } = "/opt/homebrew/bin/ollama";
     public bool RequireLoopback { get; init; } = true;
     public int RequestTimeoutSeconds { get; init; } = 900;
+    public MemoryOptions Memory { get; init; } = new();
     public LocalSpeechOptions Speech { get; init; } = new();
+}
+
+public sealed class MemoryOptions
+{
+    public bool Enabled { get; init; } = true;
+    public string EmbeddingModel { get; init; } = "nomic-embed-text:latest";
+    public string Directory { get; init; } = "App_Data/memory";
+    public string DatabaseFileName { get; init; } = "lllm-memory.sqlite";
+    public int MaxChunkCharacters { get; init; } = 1800;
+    public int ChunkOverlapCharacters { get; init; } = 180;
+    public int MaxDocumentChunks { get; init; } = 80;
 }
 
 public sealed class LocalSpeechOptions
@@ -977,12 +1554,22 @@ public enum DocumentOperation
 }
 
 public sealed record ErrorResponse(string Error);
-public sealed record StreamEvent(string Type, string? Text = null, ToolResult? ToolResult = null, OllamaStats? Stats = null, string? Error = null);
-public sealed record ChatRequest(string Model, string Message, string? SystemPrompt, bool EnableThinking = true, double? Temperature = null);
-public sealed record ChatResponse(string Response, string? Reasoning, OllamaStats? Stats, IReadOnlyList<ToolResult> ToolResults);
+public sealed record ModelActionRequest(string Model, string? KeepAlive = null);
+public sealed record OllamaStatusResponse(bool Healthy, bool ManagedProcessRunning, IReadOnlyList<LoadedOllamaModel> LoadedModels);
+public sealed record LoadedOllamaModel(string Name, long Size, string? Processor, int? ContextLength, DateTimeOffset? ExpiresAt);
+public sealed record StreamEvent(string Type, string? Text = null, ToolResult? ToolResult = null, OllamaStats? Stats = null, IReadOnlyList<MemorySearchResult>? Memories = null, string? Error = null);
+public sealed record ChatRequest(string Model, string Message, string? SystemPrompt, bool EnableThinking = true, double? Temperature = null, int? MemoryLimit = null);
+public sealed record ChatResponse(string Response, string? Reasoning, OllamaStats? Stats, IReadOnlyList<MemorySearchResult> Memories, IReadOnlyList<ToolResult> ToolResults);
+public sealed record MemoryCreateRequest(string Content, string? Title = null);
+public sealed record MemoryEntry(string Id, string Source, string? SourceId, string Title, string Content, string? MetadataJson, IReadOnlyList<double> Embedding, string EmbeddingModel, DateTimeOffset CreatedAt);
+public sealed record MemorySearchResult(string Id, string Source, string? SourceId, string Title, string Content, DateTimeOffset CreatedAt, double? Score);
 public sealed record TranscriptionResponse(string Text, double DurationMs, string ModelPath);
 public sealed record DocumentActionRequest(string Model, int? Pages = null);
+public sealed record DocumentIndexRequest(string Model, int? Pages = null);
 public sealed record UploadedDocument(string Id, string OriginalName, string Path, string Kind, long SizeBytes, DateTimeOffset UploadedAt);
+public sealed record DocumentUploadResponse(UploadedDocument Document, int IndexedChunks, string? IndexMethod, double? IndexDurationMs);
+public sealed record DocumentIndexResponse(UploadedDocument Document, int IndexedChunks, string Method, IReadOnlyList<MemorySearchResult> Chunks, double DurationMs);
+public sealed record DocumentIndexTextResponse(string Text, string Method, double DurationMs);
 public sealed record DocumentProcessResponse(string Operation, UploadedDocument Document, double TotalDurationMs, IReadOnlyList<DocumentPageResult> Pages);
 public sealed record DocumentPageResult(int Page, string Text, OllamaStats? Stats);
 public sealed record LocalTool(string Name, string Description, string ParametersJsonSchema);
@@ -996,8 +1583,11 @@ public sealed record OllamaChatRequest([property: JsonPropertyName("model")] str
 public sealed record OllamaMessage([property: JsonPropertyName("role")] string Role, [property: JsonPropertyName("content")] string? Content, [property: JsonPropertyName("thinking")] string? Thinking = null, [property: JsonPropertyName("reasoning")] string? Reasoning = null, [property: JsonPropertyName("tool_calls")] IReadOnlyList<OllamaToolCall>? ToolCalls = null, [property: JsonPropertyName("name")] string? Name = null);
 public sealed record OllamaOptions([property: JsonPropertyName("temperature")] double Temperature, [property: JsonPropertyName("top_p")] double TopP, [property: JsonPropertyName("top_k")] int TopK);
 public sealed record OllamaChatResponse([property: JsonPropertyName("model")] string? Model, [property: JsonPropertyName("message")] OllamaMessage? Message, [property: JsonPropertyName("total_duration")] long? TotalDuration = null, [property: JsonPropertyName("load_duration")] long? LoadDuration = null, [property: JsonPropertyName("prompt_eval_count")] int? PromptEvalCount = null, [property: JsonPropertyName("prompt_eval_duration")] long? PromptEvalDuration = null, [property: JsonPropertyName("eval_count")] int? EvalCount = null, [property: JsonPropertyName("eval_duration")] long? EvalDuration = null);
-public sealed record OllamaGenerateRequest([property: JsonPropertyName("model")] string Model, [property: JsonPropertyName("prompt")] string Prompt, [property: JsonPropertyName("stream")] bool Stream, [property: JsonPropertyName("images")] IReadOnlyList<string> Images, [property: JsonPropertyName("options")] OllamaOptions Options);
+public sealed record OllamaPullRequest([property: JsonPropertyName("model")] string Model, [property: JsonPropertyName("stream")] bool Stream);
+public sealed record OllamaGenerateRequest([property: JsonPropertyName("model")] string Model, [property: JsonPropertyName("prompt")] string Prompt, [property: JsonPropertyName("stream")] bool Stream, [property: JsonPropertyName("images")] IReadOnlyList<string>? Images, [property: JsonPropertyName("options")] OllamaOptions Options, [property: JsonPropertyName("keep_alive")] string? KeepAlive = null);
 public sealed record OllamaGenerateResponse([property: JsonPropertyName("response")] string Response, [property: JsonPropertyName("total_duration")] long? TotalDuration = null, [property: JsonPropertyName("load_duration")] long? LoadDuration = null, [property: JsonPropertyName("prompt_eval_count")] int? PromptEvalCount = null, [property: JsonPropertyName("prompt_eval_duration")] long? PromptEvalDuration = null, [property: JsonPropertyName("eval_count")] int? EvalCount = null, [property: JsonPropertyName("eval_duration")] long? EvalDuration = null);
+public sealed record OllamaEmbeddingRequest([property: JsonPropertyName("model")] string Model, [property: JsonPropertyName("prompt")] string Prompt);
+public sealed record OllamaEmbeddingResponse([property: JsonPropertyName("embedding")] IReadOnlyList<double> Embedding);
 public sealed record OllamaTool([property: JsonPropertyName("type")] string Type, [property: JsonPropertyName("function")] OllamaFunctionTool Function);
 public sealed record OllamaFunctionTool([property: JsonPropertyName("name")] string Name, [property: JsonPropertyName("description")] string Description, [property: JsonPropertyName("parameters")] JsonNode Parameters);
 public sealed record OllamaToolCall([property: JsonPropertyName("function")] OllamaToolCallFunction? Function);

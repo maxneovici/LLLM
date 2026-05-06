@@ -229,6 +229,114 @@ textarea { resize: vertical; }
   gap: 10px;
 }
 
+.button-row.compact button {
+  padding: 0.62rem 0.72rem;
+  font-size: 0.86rem;
+}
+
+.runtime-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid rgba(125, 211, 252, 0.18);
+  border-radius: 18px;
+  background: rgba(2, 6, 23, 0.36);
+}
+
+.memory-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid rgba(134, 239, 172, 0.18);
+  border-radius: 18px;
+  background: rgba(2, 6, 23, 0.34);
+}
+
+.memory-header {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: start;
+}
+
+.memory-header div {
+  display: grid;
+  gap: 3px;
+}
+
+.memory-header span,
+.memory-results,
+.memory-result-meta {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.memory-results {
+  max-height: 220px;
+  overflow: auto;
+  display: grid;
+  gap: 8px;
+  white-space: normal;
+}
+
+.memory-result {
+  display: grid;
+  gap: 5px;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: rgba(15, 23, 42, 0.52);
+}
+
+.memory-result-header {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.memory-result p {
+  margin: 0;
+  color: var(--text);
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.memory-forget {
+  padding: 0.32rem 0.48rem;
+  border-radius: 9px;
+  font-size: 0.72rem;
+}
+
+.runtime-header {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: start;
+}
+
+.runtime-header div {
+  display: grid;
+  gap: 3px;
+}
+
+.runtime-header span,
+.loaded-models {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.loaded-models {
+  padding: 10px;
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.46);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .chat-panel {
   display: grid;
   grid-template-rows: 1fr auto;
@@ -423,6 +531,44 @@ textarea { resize: vertical; }
   border-radius: 14px;
   background: rgba(251, 191, 36, 0.06);
   overflow: hidden;
+}
+
+.used-memory {
+  margin-bottom: 12px;
+  border: 1px solid rgba(134, 239, 172, 0.20);
+  border-radius: 14px;
+  background: rgba(134, 239, 172, 0.05);
+  overflow: hidden;
+}
+
+.used-memory summary {
+  cursor: pointer;
+  padding: 10px 12px;
+  color: var(--green);
+  font-weight: 800;
+}
+
+.used-memory-body {
+  display: grid;
+  gap: 8px;
+  padding: 0 12px 12px;
+}
+
+.used-memory-item {
+  display: grid;
+  gap: 4px;
+  color: var(--text);
+}
+
+.used-memory-item span {
+  color: var(--muted);
+  white-space: pre-wrap;
+}
+
+.used-memory-item em {
+  color: var(--green);
+  font-size: 0.76rem;
+  font-style: normal;
 }
 
 .reasoning-box summary {

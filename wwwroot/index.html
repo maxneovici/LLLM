@@ -3,7 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07080b">
   <title>LLLM</title>
+  <link rel="manifest" href="/manifest.webmanifest">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -29,6 +31,25 @@
         <select id="modelSelect"></select>
         <button id="refreshModels" class="secondary">Refresh Models</button>
 
+        <section class="runtime-card">
+          <div class="runtime-header">
+            <div>
+              <strong>Local Runtime</strong>
+              <span id="runtimeStatus">Checking Ollama</span>
+            </div>
+            <button id="runtimeRefresh" class="secondary" type="button">Status</button>
+          </div>
+          <div class="button-row compact">
+            <button id="startOllamaButton" type="button">Start Ollama</button>
+            <button id="warmModelButton" class="secondary" type="button">Load Model</button>
+          </div>
+          <div class="button-row compact">
+            <button id="unloadModelButton" class="secondary" type="button">Unload</button>
+            <button id="pullModelButton" class="secondary" type="button">Pull</button>
+          </div>
+          <div id="loadedModels" class="loaded-models">No loaded models.</div>
+        </section>
+
         <label for="systemPrompt">System prompt</label>
         <textarea id="systemPrompt" rows="5">You are LLLM, a concise local-only assistant. Use tools when they help.</textarea>
 
@@ -37,13 +58,29 @@
         </div>
 
         <div id="dropzone" class="dropzone">
-          <input id="fileInput" type="file" accept="application/pdf,image/*" hidden>
+          <input id="fileInput" type="file" accept="application/pdf,image/*,.txt,.md,.csv,.json,.log" hidden>
           <div class="drop-icon">PDF</div>
-          <strong>Drop PDF/image</strong>
-          <span>or click to upload</span>
+          <strong>Drop document</strong>
+          <span>PDF/image/text; auto-indexed locally</span>
         </div>
 
         <div id="documentCard" class="document-card empty">No document uploaded.</div>
+
+        <section class="memory-card">
+          <div class="memory-header">
+            <div>
+              <strong>Local Memory</strong>
+              <span id="memoryStatus">SQLite + nomic embeddings</span>
+            </div>
+            <button id="refreshMemoryButton" class="secondary" type="button">Recent</button>
+          </div>
+          <textarea id="memoryInput" rows="3" placeholder="Remember a fact, preference, or decision..."></textarea>
+          <div class="button-row compact">
+            <button id="rememberButton" type="button">Remember</button>
+            <button id="searchMemoryButton" class="secondary" type="button">Search</button>
+          </div>
+          <div id="memoryResults" class="memory-results">No memory loaded.</div>
+        </section>
 
         <div class="button-row">
           <button id="ocrButton">Run OCR</button>

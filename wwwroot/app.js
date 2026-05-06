@@ -20,11 +20,24 @@ const state = {
 
 const modelSelect = document.querySelector('#modelSelect');
 const refreshModels = document.querySelector('#refreshModels');
+const runtimeRefresh = document.querySelector('#runtimeRefresh');
+const runtimeStatus = document.querySelector('#runtimeStatus');
+const startOllamaButton = document.querySelector('#startOllamaButton');
+const warmModelButton = document.querySelector('#warmModelButton');
+const unloadModelButton = document.querySelector('#unloadModelButton');
+const pullModelButton = document.querySelector('#pullModelButton');
+const loadedModels = document.querySelector('#loadedModels');
 const systemPrompt = document.querySelector('#systemPrompt');
 const thinkingToggle = document.querySelector('#thinkingToggle');
 const dropzone = document.querySelector('#dropzone');
 const fileInput = document.querySelector('#fileInput');
 const documentCard = document.querySelector('#documentCard');
+const memoryInput = document.querySelector('#memoryInput');
+const memoryStatus = document.querySelector('#memoryStatus');
+const memoryResults = document.querySelector('#memoryResults');
+const refreshMemoryButton = document.querySelector('#refreshMemoryButton');
+const rememberButton = document.querySelector('#rememberButton');
+const searchMemoryButton = document.querySelector('#searchMemoryButton');
 const ocrButton = document.querySelector('#ocrButton');
 const invoiceButton = document.querySelector('#invoiceButton');
 const messages = document.querySelector('#messages');
@@ -39,17 +52,34 @@ const healthSubtext = document.querySelector('#healthSubtext');
 init();
 
 async function init() {
+  registerServiceWorker();
   await checkHealth();
   await loadModels();
+  await refreshRuntimeStatus();
+  await loadRecentMemory();
   bindEvents();
   addMessage('assistant', 'Drop a PDF/image or ask a question. Tool calling is enabled on the backend.');
+}
+
+function registerServiceWorker() {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(error => console.warn('Service worker registration failed', error));
+  }
 }
 
 function bindEvents() {
   refreshModels.addEventListener('click', loadModels);
   modelSelect.addEventListener('change', () => state.model = modelSelect.value);
+  runtimeRefresh.addEventListener('click', refreshRuntimeStatus);
+  startOllamaButton.addEventListener('click', startOllama);
+  warmModelButton.addEventListener('click', warmSelectedModel);
+  unloadModelButton.addEventListener('click', unloadSelectedModel);
+  pullModelButton.addEventListener('click', pullSelectedModel);
   dropzone.addEventListener('click', () => fileInput.click());
   fileInput.addEventListener('change', () => uploadFile(fileInput.files[0]));
+  refreshMemoryButton.addEventListener('click', loadRecentMemory);
+  rememberButton.addEventListener('click', rememberMemory);
+  searchMemoryButton.addEventListener('click', searchMemory);
   ocrButton.addEventListener('click', () => runDocumentAction('/api/ocr', 'OCR'));
   invoiceButton.addEventListener('click', () => runDocumentAction('/api/invoice', 'Invoice extraction'));
   voiceButton.addEventListener('click', toggleRecording);
@@ -370,20 +400,180 @@ async function loadModels() {
   }
 }
 
+async function refreshRuntimeStatus() {
+  try {
+    const response = await fetch('/api/ollama/status');
+    const status = await readJsonOrThrow(response);
+    runtimeStatus.textContent = status.healthy
+      ? status.managedProcessRunning ? 'Ollama online, app-managed' : 'Ollama online'
+      : 'Ollama offline';
+    loadedModels.textContent = status.loadedModels?.length
+      ? status.loadedModels.map(model => `${model.name} ${formatGb(model.size)}${model.processor ? ` on ${model.processor}` : ''}`).join('\n')
+      : 'No loaded models.';
+  } catch (error) {
+    runtimeStatus.textContent = `Status failed: ${error.message}`;
+    loadedModels.textContent = 'No loaded models.';
+  }
+}
+
+async function startOllama() {
+  await runRuntimeAction('Starting Ollama locally', async () => {
+    const response = await fetch('/api/ollama/start', { method: 'POST' });
+    await readJsonOrThrow(response);
+    await checkHealth();
+    await loadModels();
+    await refreshRuntimeStatus();
+  });
+}
+
+async function warmSelectedModel() {
+  await runRuntimeAction(`Loading ${state.model}`, async () => {
+    const response = await fetch('/api/ollama/warm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: state.model, keepAlive: '15m' })
+    });
+    const result = await readJsonOrThrow(response);
+    addMessage('tool', `Loaded ${state.model}`, formatStats(result.stats));
+    await refreshRuntimeStatus();
+  });
+}
+
+async function unloadSelectedModel() {
+  await runRuntimeAction(`Unloading ${state.model}`, async () => {
+    const response = await fetch('/api/ollama/unload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: state.model })
+    });
+    await readJsonOrThrow(response);
+    addMessage('tool', `Unloaded ${state.model}`);
+    await refreshRuntimeStatus();
+  });
+}
+
+async function pullSelectedModel() {
+  const model = window.prompt('Model tag to pull locally', state.model || 'gemma4:e2b');
+
+  if (!model) {
+    return;
+  }
+
+  await runRuntimeAction(`Pulling ${model}`, async () => {
+    const response = await fetch('/api/ollama/pull', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model })
+    });
+    await readJsonOrThrow(response);
+    addMessage('tool', `Pulled ${model}`);
+    await loadModels();
+    await refreshRuntimeStatus();
+  });
+}
+
+async function runRuntimeAction(statusText, action) {
+  setBusy(true);
+  runtimeStatus.textContent = statusText;
+
+  try {
+    await action();
+  } catch (error) {
+    addMessage('error', error.message);
+    runtimeStatus.textContent = `Runtime action failed: ${error.message}`;
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function uploadFile(file) {
   if (!file || state.busy) return;
   setBusy(true);
   const form = new FormData();
   form.append('file', file);
+  form.append('model', state.model);
 
   try {
     const response = await fetch('/api/documents', { method: 'POST', body: form });
     const result = await readJsonOrThrow(response);
-    state.currentDocument = result;
-    renderDocument(result);
-    addMessage('tool', `Uploaded ${result.originalName}\n${formatGb(result.sizeBytes)} ${result.kind}`);
+    const document = result.document ?? result;
+    state.currentDocument = document;
+    renderDocument(document, result);
+    addMessage('tool', `Uploaded and indexed ${document.originalName}\n${formatGb(document.sizeBytes)} ${document.kind}\n${result.indexedChunks ?? 0} memory chunk(s) via ${result.indexMethod ?? 'none'}`);
+    await loadRecentMemory();
   } catch (error) {
     addMessage('error', `Upload failed: ${error.message}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function rememberMemory() {
+  const content = memoryInput.value.trim();
+  if (!content || state.busy) return;
+
+  setBusy(true);
+  memoryStatus.textContent = 'Embedding memory locally';
+
+  try {
+    const response = await fetch('/api/memory', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, title: content.slice(0, 80) })
+    });
+    await readJsonOrThrow(response);
+    memoryInput.value = '';
+    memoryStatus.textContent = 'Memory saved locally';
+    await loadRecentMemory();
+  } catch (error) {
+    memoryStatus.textContent = `Memory failed: ${error.message}`;
+    addMessage('error', error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function searchMemory() {
+  const query = memoryInput.value.trim() || messageInput.value.trim();
+  if (!query || state.busy) return;
+
+  setBusy(true);
+  memoryStatus.textContent = 'Vector searching locally';
+
+  try {
+    const response = await fetch(`/api/memory/search?q=${encodeURIComponent(query)}&limit=8`);
+    const results = await readJsonOrThrow(response);
+    renderMemoryResults(results, true);
+    memoryStatus.textContent = `${results.length} memory match(es)`;
+  } catch (error) {
+    memoryStatus.textContent = `Search failed: ${error.message}`;
+    addMessage('error', error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function loadRecentMemory() {
+  try {
+    const response = await fetch('/api/memory/recent?limit=8');
+    const results = await readJsonOrThrow(response);
+    renderMemoryResults(results, false);
+    memoryStatus.textContent = `${results.length} recent local memories`;
+  } catch (error) {
+    memoryStatus.textContent = `Memory unavailable: ${error.message}`;
+  }
+}
+
+async function forgetMemory(id) {
+  if (!id || state.busy) return;
+
+  setBusy(true);
+  try {
+    const response = await fetch(`/api/memory/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    await readJsonOrThrow(response);
+    await loadRecentMemory();
+  } catch (error) {
+    addMessage('error', error.message);
   } finally {
     setBusy(false);
   }
@@ -461,6 +651,10 @@ function handleStreamEvent(event, assistant) {
       assistant.stats = event.stats;
       assistant.meta.textContent = formatStats(event.stats);
       break;
+    case 'memory':
+      assistant.memories = event.memories ?? [];
+      renderUsedMemories(assistant);
+      break;
     case 'error':
       addMessage('error', event.error ?? 'Unknown stream error');
       break;
@@ -486,14 +680,42 @@ function createAssistantStreamMessage() {
 
   const answer = document.createElement('div');
   answer.className = 'answer-stream';
+  const memory = document.createElement('details');
+  memory.className = 'used-memory';
+  memory.hidden = true;
+  const memorySummary = document.createElement('summary');
+  memorySummary.textContent = 'Memory Used';
+  const memoryBody = document.createElement('div');
+  memoryBody.className = 'used-memory-body';
+  memory.append(memorySummary, memoryBody);
   const meta = document.createElement('div');
   meta.className = 'meta';
 
-  bubble.append(reasoning, answer, meta);
+  bubble.append(reasoning, memory, answer, meta);
   messages.appendChild(bubble);
   messages.scrollTop = messages.scrollHeight;
 
-  return { bubble, reasoning, reasoningBody, answer, meta, reasoningText: '', answerText: '', stats: null };
+  return { bubble, reasoning, reasoningBody, memory, memoryBody, answer, meta, reasoningText: '', answerText: '', memories: [], stats: null };
+}
+
+function renderUsedMemories(assistant) {
+  if (!assistant.memories?.length) {
+    assistant.memory.hidden = true;
+    return;
+  }
+
+  assistant.memory.hidden = false;
+  assistant.memoryBody.innerHTML = '';
+
+  for (const item of assistant.memories) {
+    const row = documentCreate('div', 'used-memory-item');
+    const title = documentCreate('strong', '', `${item.source}: ${item.title}`);
+    const content = documentCreate('span', '', item.content);
+    const score = item.score == null ? '' : `score ${item.score.toFixed(3)}`;
+    const meta = documentCreate('em', '', score);
+    row.append(title, content, meta);
+    assistant.memoryBody.appendChild(row);
+  }
 }
 
 function finalizeAssistantStreamMessage(assistant) {
@@ -673,9 +895,34 @@ function renderDocumentResult(result) {
   addMessage('tool', text, `${result.operation} total wall time ${formatMs(result.totalDurationMs)}`);
 }
 
-function renderDocument(document) {
+function renderMemoryResults(results, withScores) {
+  memoryResults.innerHTML = '';
+
+  if (!results?.length) {
+    memoryResults.textContent = 'No memory found.';
+    return;
+  }
+
+  for (const item of results) {
+    const row = documentCreate('div', 'memory-result');
+    const header = documentCreate('div', 'memory-result-header');
+    const title = documentCreate('strong', '', item.title || 'Memory');
+    const forget = documentCreate('button', 'secondary memory-forget', 'Forget');
+    forget.type = 'button';
+    forget.addEventListener('click', () => forgetMemory(item.id));
+    const metaText = [item.source, withScores && item.score != null ? item.score.toFixed(3) : '', new Date(item.createdAt).toLocaleString()].filter(Boolean).join(' | ');
+    const meta = documentCreate('span', 'memory-result-meta', metaText);
+    const content = documentCreate('p', '', item.content);
+    header.append(title, forget);
+    row.append(header, meta, content);
+    memoryResults.appendChild(row);
+  }
+}
+
+function renderDocument(document, uploadResult = null) {
   documentCard.classList.remove('empty');
-  documentCard.textContent = `${document.originalName}\n${document.kind} | ${formatGb(document.sizeBytes)}`;
+  const indexText = uploadResult ? `\nindexed chunks: ${uploadResult.indexedChunks ?? 0}` : '';
+  documentCard.textContent = `${document.originalName}\n${document.kind} | ${formatGb(document.sizeBytes)}${indexText}`;
 }
 
 function addMessage(role, text, meta = '') {
@@ -706,7 +953,7 @@ async function readJsonOrThrow(response) {
 function setBusy(busy) {
   state.busy = busy;
   document.body.classList.toggle('busy', busy);
-  for (const element of [refreshModels, ocrButton, invoiceButton, chatForm.querySelector('button[type="submit"]')]) {
+  for (const element of [refreshModels, runtimeRefresh, startOllamaButton, warmModelButton, unloadModelButton, pullModelButton, refreshMemoryButton, rememberButton, searchMemoryButton, ocrButton, invoiceButton, chatForm.querySelector('button[type="submit"]')]) {
     element.disabled = busy;
   }
 }

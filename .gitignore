@@ -2,6 +2,7 @@ bin/
 obj/
 App_Data/
 models/
+artifacts/
 .DS_Store
 *.user
 *.suo
