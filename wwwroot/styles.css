@@ -174,7 +174,16 @@ select, textarea {
   outline: none;
 }
 
-textarea { resize: vertical; }
+textarea {
+  resize: vertical;
+  min-height: 0;
+  overflow: auto;
+}
+
+#systemPrompt {
+  max-height: 150px;
+  resize: vertical;
+}
 
 .toggles {
   display: flex;

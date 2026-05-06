@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net.Http.Json;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -464,9 +465,9 @@ static ReasoningRoute ClassifyReasoningEffort(string message, int? requestedMemo
     var text = message.Trim();
     var lower = text.ToLowerInvariant();
     var wordCount = text.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Length;
-    var casualPatterns = new[]
+    var casualPhrases = new[]
     {
-        "hi", "hello", "hey", "yo", "sup", "thanks", "thank you", "ok", "okay", "cool", "nice",
+        "hello", "hey", "sup", "thanks", "thank you", "okay", "cool", "nice",
         "how are you", "how's it going", "hows it going", "what's up", "whats up", "good morning", "good night"
     };
     var complexSignals = new[]
@@ -476,9 +477,11 @@ static ReasoningRoute ClassifyReasoningEffort(string message, int? requestedMemo
         "summarize", "extract", "calculate", "reason", "deep", "thorough"
     };
 
-    var looksLikeCasualGreeting = casualPatterns.Any(pattern => lower.Contains(pattern))
-        || (lower.Contains("how") && (lower.Contains("going") || lower.Contains("goin")))
-        || (lower.Contains("what") && lower.Contains("up"));
+    var tokens = Regex.Matches(lower, "[a-z0-9']+").Select(match => match.Value).ToHashSet(StringComparer.OrdinalIgnoreCase);
+    var looksLikeCasualGreeting = casualPhrases.Any(pattern => lower.Contains(pattern, StringComparison.Ordinal))
+        || tokens.Overlaps(["hi", "yo", "ok"])
+        || (tokens.Contains("how") && (tokens.Contains("going") || tokens.Contains("goin")))
+        || (tokens.Contains("what") && tokens.Contains("up"));
 
     if (wordCount <= 12 && text.Length <= 90 && looksLikeCasualGreeting)
     {
