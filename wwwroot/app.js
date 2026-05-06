@@ -19,6 +19,7 @@ const ocrButton = document.querySelector('#ocrButton');
 const invoiceButton = document.querySelector('#invoiceButton');
 const messages = document.querySelector('#messages');
 const chatForm = document.querySelector('#chatForm');
+const voiceStatus = document.querySelector('#voiceStatus');
 const messageInput = document.querySelector('#messageInput');
 const voiceButton = document.querySelector('#voiceButton');
 const healthDot = document.querySelector('#healthDot');
@@ -108,6 +109,7 @@ function startRecordingUi() {
   state.recordingStartedAt = performance.now();
   voiceButton.classList.add('recording');
   voiceButton.textContent = 'Stop 0.0s';
+  showVoiceStatus('Recording locally. Click Stop when done.', 'recording');
   state.recordingTimer = window.setInterval(() => {
     voiceButton.textContent = `Stop ${((performance.now() - state.recordingStartedAt) / 1000).toFixed(1)}s`;
   }, 250);
@@ -137,8 +139,7 @@ async function transcribeRecording() {
     const response = await fetch('/api/transcribe', { method: 'POST', body: form });
     progress.setStep('Reading local transcript');
     const result = await readJsonOrThrow(response);
-    const existingText = messageInput.value.trim();
-    messageInput.value = existingText ? `${existingText}\n${result.text}` : result.text;
+    appendTranscriptToComposer(result.text);
     messageInput.focus();
     progress.complete(result);
   } catch (error) {
@@ -147,6 +148,18 @@ async function transcribeRecording() {
   } finally {
     setBusy(false);
   }
+}
+
+function appendTranscriptToComposer(text) {
+  const transcript = text.trim();
+
+  if (!transcript) {
+    return;
+  }
+
+  const existingText = messageInput.value.trimEnd();
+  messageInput.value = existingText ? `${existingText}\n${transcript}` : transcript;
+  messageInput.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
 async function checkHealth() {
@@ -416,47 +429,54 @@ function createDocumentProgress(label, document) {
 
 function createVoiceProgress() {
   const startedAt = performance.now();
-  const bubble = documentCreate('article', 'message tool progress-card voice-progress');
-  const header = documentCreate('div', 'progress-header');
-  const spinner = documentCreate('div', 'scanner voice-scanner');
-  const title = documentCreate('strong', '', 'Transcribing voice locally');
-  const timer = documentCreate('span', 'progress-timer', '0.0 s');
-  const step = documentCreate('div', 'progress-step', 'Preparing local speech model');
-  const waveform = documentCreate('div', 'waveform');
-
-  for (let index = 0; index < 18; index++) {
-    waveform.appendChild(documentCreate('span'));
-  }
-
-  header.append(spinner, title, timer);
-  bubble.append(header, waveform, step);
-  messages.appendChild(bubble);
-  messages.scrollTop = messages.scrollHeight;
+  showVoiceStatus('Preparing local speech model', 'transcribing', '0.0 s');
 
   const interval = window.setInterval(() => {
-    timer.textContent = formatMs(performance.now() - startedAt);
+    updateVoiceStatusTime(formatMs(performance.now() - startedAt));
   }, 200);
 
   return {
     setStep(text) {
-      step.textContent = text;
+      showVoiceStatus(text, 'transcribing', formatMs(performance.now() - startedAt));
     },
     complete(result) {
       window.clearInterval(interval);
-      bubble.classList.remove('progress-card');
-      bubble.classList.add('progress-done');
-      spinner.classList.add('done');
-      timer.textContent = formatMs(result.durationMs ?? performance.now() - startedAt);
-      step.textContent = `Transcript inserted into prompt (${result.text.length} chars).`;
+      showVoiceStatus(`Transcript inserted (${result.text.trim().length} chars). Press Enter to send.`, 'done', formatMs(result.durationMs ?? performance.now() - startedAt));
+      window.setTimeout(hideVoiceStatus, 3500);
     },
     fail(error) {
       window.clearInterval(interval);
-      bubble.classList.remove('progress-card');
-      bubble.classList.add('progress-failed');
-      spinner.classList.add('failed');
-      step.textContent = `Failed: ${error.message}`;
+      showVoiceStatus(`Voice transcription failed: ${error.message}`, 'failed');
     }
   };
+}
+
+function showVoiceStatus(text, mode = 'idle', time = '') {
+  voiceStatus.hidden = false;
+  voiceStatus.className = `voice-status ${mode}`;
+  voiceStatus.innerHTML = '';
+
+  const pulse = documentCreate('span', 'voice-status-pulse');
+  const label = documentCreate('span', 'voice-status-label', text);
+  const timer = documentCreate('span', 'voice-status-time', time);
+  voiceStatus.append(pulse, label, timer);
+}
+
+function updateVoiceStatusTime(time) {
+  const timer = voiceStatus.querySelector('.voice-status-time');
+
+  if (timer) {
+    timer.textContent = time;
+  }
+}
+
+function hideVoiceStatus() {
+  if (state.mediaRecorder?.state === 'recording') {
+    return;
+  }
+
+  voiceStatus.hidden = true;
+  voiceStatus.innerHTML = '';
 }
 
 function documentCreate(tag, className = '', text = '') {

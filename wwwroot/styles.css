@@ -487,6 +487,55 @@ textarea { resize: vertical; }
   background: rgba(2, 6, 23, 0.38);
 }
 
+.voice-status {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid rgba(125, 211, 252, 0.22);
+  border-radius: 14px;
+  color: var(--muted);
+  background: rgba(15, 23, 42, 0.62);
+}
+
+.voice-status[hidden] { display: none; }
+
+.voice-status-pulse {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 18px var(--accent);
+}
+
+.voice-status.recording .voice-status-pulse {
+  background: var(--red);
+  box-shadow: 0 0 18px var(--red);
+  animation: blink 0.8s steps(2, start) infinite;
+}
+
+.voice-status.transcribing .voice-status-pulse {
+  animation: recordingPulse 1s ease-in-out infinite;
+}
+
+.voice-status.done .voice-status-pulse {
+  background: var(--green);
+  box-shadow: 0 0 18px var(--green);
+}
+
+.voice-status.failed .voice-status-pulse {
+  background: var(--red);
+  box-shadow: 0 0 18px var(--red);
+}
+
+.voice-status-time {
+  color: var(--accent);
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+
 @media (max-width: 900px) {
   body { overflow: auto; }
   .shell { height: auto; min-height: 100vh; overflow: visible; }
