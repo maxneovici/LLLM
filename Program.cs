@@ -29,6 +29,7 @@ builder.Services.AddHttpClient("ollama", (serviceProvider, client) =>
 builder.Services.AddSingleton<AppState>();
 builder.Services.AddSingleton<OllamaClient>();
 builder.Services.AddSingleton<DocumentProcessor>();
+builder.Services.AddSingleton<SpeechTranscriber>();
 builder.Services.AddSingleton<LocalToolRegistry>();
 
 var app = builder.Build();
@@ -87,6 +88,25 @@ app.MapPost("/api/documents", async (HttpRequest request, AppState state, IWebHo
 
     state.CurrentDocument = document;
     return Results.Ok(document);
+});
+
+app.MapPost("/api/transcribe", async (HttpRequest request, SpeechTranscriber transcriber, CancellationToken cancellationToken) =>
+{
+    if (!request.HasFormContentType)
+    {
+        return Results.BadRequest(new ErrorResponse("Expected multipart form data."));
+    }
+
+    var form = await request.ReadFormAsync(cancellationToken);
+    var file = form.Files.GetFile("audio");
+
+    if (file is null || file.Length == 0)
+    {
+        return Results.BadRequest(new ErrorResponse("Record audio before transcribing."));
+    }
+
+    var result = await transcriber.TranscribeAsync(file, cancellationToken);
+    return Results.Ok(result);
 });
 
 app.MapPost("/api/chat", async (ChatRequest request, OllamaClient ollama, LocalToolRegistry tools, AppState state, CancellationToken cancellationToken) =>
@@ -757,11 +777,189 @@ public sealed class DocumentProcessor(OllamaClient ollama, IWebHostEnvironment e
     }
 }
 
+public sealed class SpeechTranscriber(Microsoft.Extensions.Options.IOptions<LocalAiOptions> options, IWebHostEnvironment environment)
+{
+    private readonly LocalSpeechOptions _speech = options.Value.Speech;
+
+    public async Task<TranscriptionResponse> TranscribeAsync(IFormFile audio, CancellationToken cancellationToken)
+    {
+        if (!_speech.Enabled)
+        {
+            throw new InvalidOperationException("Local speech transcription is disabled. Set LocalAi:Speech:Enabled=true.");
+        }
+
+        if (string.IsNullOrWhiteSpace(_speech.WhisperExecutable) || !File.Exists(_speech.WhisperExecutable))
+        {
+            throw new InvalidOperationException($"Whisper executable not found: {_speech.WhisperExecutable}. Configure LocalAi:Speech:WhisperExecutable.");
+        }
+
+        if (string.IsNullOrWhiteSpace(_speech.ModelPath) || !File.Exists(_speech.ModelPath))
+        {
+            throw new InvalidOperationException($"Whisper model not found: {_speech.ModelPath}. Configure LocalAi:Speech:ModelPath.");
+        }
+
+        var audioDirectory = Path.Combine(environment.ContentRootPath, "App_Data", "audio");
+        Directory.CreateDirectory(audioDirectory);
+
+        var inputPath = Path.Combine(audioDirectory, $"{Guid.NewGuid():N}{Path.GetExtension(audio.FileName)}");
+        var wavPath = Path.ChangeExtension(inputPath, ".wav");
+        var outputPrefix = Path.Combine(audioDirectory, Guid.NewGuid().ToString("N"));
+        var stopwatch = Stopwatch.StartNew();
+
+        await using (var stream = File.Create(inputPath))
+        {
+            await audio.CopyToAsync(stream, cancellationToken);
+        }
+
+        try
+        {
+            await ConvertAudioToWavAsync(inputPath, wavPath, cancellationToken);
+            var arguments = new List<string>
+            {
+                "-m", _speech.ModelPath,
+                "-f", wavPath,
+                "-otxt",
+                "-of", outputPrefix,
+                "-nt"
+            };
+
+            if (!string.IsNullOrWhiteSpace(_speech.Language))
+            {
+                arguments.Add("-l");
+                arguments.Add(_speech.Language);
+            }
+
+            var result = await RunProcessAsync(_speech.WhisperExecutable, arguments, environment.ContentRootPath, TimeSpan.FromSeconds(_speech.TimeoutSeconds), cancellationToken);
+
+            if (result.ExitCode != 0)
+            {
+                throw new InvalidOperationException($"whisper.cpp failed: {result.StandardError}");
+            }
+
+            var textPath = $"{outputPrefix}.txt";
+            var transcript = File.Exists(textPath)
+                ? await File.ReadAllTextAsync(textPath, cancellationToken)
+                : result.StandardOutput;
+
+            stopwatch.Stop();
+            return new TranscriptionResponse(transcript.Trim(), stopwatch.Elapsed.TotalMilliseconds, _speech.ModelPath);
+        }
+        finally
+        {
+            TryDeleteFile(inputPath);
+            TryDeleteFile(wavPath);
+            TryDeleteFile($"{outputPrefix}.txt");
+        }
+    }
+
+    private async Task ConvertAudioToWavAsync(string inputPath, string wavPath, CancellationToken cancellationToken)
+    {
+        if (!string.IsNullOrWhiteSpace(_speech.FfmpegExecutable) && File.Exists(_speech.FfmpegExecutable))
+        {
+            var result = await RunProcessAsync(
+                _speech.FfmpegExecutable,
+                ["-y", "-i", inputPath, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wavPath],
+                environment.ContentRootPath,
+                TimeSpan.FromSeconds(_speech.TimeoutSeconds),
+                cancellationToken);
+
+            if (result.ExitCode == 0)
+            {
+                return;
+            }
+        }
+
+        if (OperatingSystem.IsMacOS())
+        {
+            var result = await RunProcessAsync(
+                "afconvert",
+                ["-f", "WAVE", "-d", "LEI16@16000", "-c", "1", inputPath, wavPath],
+                environment.ContentRootPath,
+                TimeSpan.FromSeconds(_speech.TimeoutSeconds),
+                cancellationToken);
+
+            if (result.ExitCode == 0)
+            {
+                return;
+            }
+        }
+
+        throw new InvalidOperationException("Could not convert browser audio to 16 kHz mono WAV. Install ffmpeg or run on macOS with afconvert.");
+    }
+
+    private static async Task<ProcessResult> RunProcessAsync(string fileName, IReadOnlyList<string> arguments, string workingDirectory, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        using var process = new Process();
+        process.StartInfo = new ProcessStartInfo
+        {
+            FileName = fileName,
+            WorkingDirectory = workingDirectory,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+
+        foreach (var argument in arguments)
+        {
+            process.StartInfo.ArgumentList.Add(argument);
+        }
+
+        using var timeoutSource = new CancellationTokenSource(timeout);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource.Token);
+        process.Start();
+
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(linked.Token);
+        var stderrTask = process.StandardError.ReadToEndAsync(linked.Token);
+
+        try
+        {
+            await process.WaitForExitAsync(linked.Token);
+        }
+        catch (OperationCanceledException) when (timeoutSource.IsCancellationRequested)
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+            }
+
+            return new ProcessResult(-1, string.Empty, $"Process timed out after {timeout.TotalSeconds:0} seconds: {fileName}");
+        }
+
+        return new ProcessResult(process.ExitCode, await stdoutTask, await stderrTask);
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
+}
+
 public sealed class LocalAiOptions
 {
     public string BaseUrl { get; init; } = "http://127.0.0.1:11434";
     public bool RequireLoopback { get; init; } = true;
     public int RequestTimeoutSeconds { get; init; } = 900;
+    public LocalSpeechOptions Speech { get; init; } = new();
+}
+
+public sealed class LocalSpeechOptions
+{
+    public bool Enabled { get; init; } = true;
+    public string WhisperExecutable { get; init; } = "/opt/homebrew/bin/whisper-cli";
+    public string ModelPath { get; init; } = "models/ggml-base.en.bin";
+    public string Language { get; init; } = "en";
+    public string FfmpegExecutable { get; init; } = "/opt/homebrew/bin/ffmpeg";
+    public int TimeoutSeconds { get; init; } = 120;
 }
 
 public enum DocumentOperation
@@ -775,6 +973,7 @@ public sealed record ErrorResponse(string Error);
 public sealed record StreamEvent(string Type, string? Text = null, ToolResult? ToolResult = null, OllamaStats? Stats = null, string? Error = null);
 public sealed record ChatRequest(string Model, string Message, string? SystemPrompt, bool EnableThinking = true, double? Temperature = null);
 public sealed record ChatResponse(string Response, string? Reasoning, OllamaStats? Stats, IReadOnlyList<ToolResult> ToolResults);
+public sealed record TranscriptionResponse(string Text, double DurationMs, string ModelPath);
 public sealed record DocumentActionRequest(string Model, int? Pages = null);
 public sealed record UploadedDocument(string Id, string OriginalName, string Path, string Kind, long SizeBytes, DateTimeOffset UploadedAt);
 public sealed record DocumentProcessResponse(string Operation, UploadedDocument Document, double TotalDurationMs, IReadOnlyList<DocumentPageResult> Pages);

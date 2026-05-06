@@ -17,9 +17,12 @@
 
 * { box-sizing: border-box; }
 
+html, body { height: 100%; }
+
 body {
   margin: 0;
   min-height: 100vh;
+  overflow: hidden;
   color: var(--text);
   background:
     radial-gradient(circle at top left, rgba(56, 189, 248, 0.18), transparent 34rem),
@@ -50,10 +53,26 @@ button.secondary {
   border: 1px solid var(--line);
 }
 
+.voice-button {
+  min-width: 74px;
+  color: #fef2f2;
+  background: linear-gradient(135deg, rgba(127, 29, 29, 0.78), rgba(14, 116, 144, 0.82));
+}
+
+.voice-button.recording {
+  border-color: rgba(251, 113, 133, 0.72);
+  background: linear-gradient(135deg, rgba(185, 28, 28, 0.9), rgba(127, 29, 29, 0.88));
+  animation: recordingPulse 1.1s ease-in-out infinite;
+}
+
 .shell {
   width: min(1320px, calc(100vw - 32px));
   margin: 0 auto;
-  padding: 28px 0;
+  height: 100vh;
+  padding: 24px 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
 }
 
 .hero {
@@ -61,7 +80,8 @@ button.secondary {
   align-items: end;
   justify-content: space-between;
   gap: 24px;
-  margin-bottom: 22px;
+  margin-bottom: 18px;
+  min-height: 0;
 }
 
 .eyebrow {
@@ -117,7 +137,8 @@ h1 {
   display: grid;
   grid-template-columns: 360px 1fr;
   gap: 18px;
-  min-height: 680px;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .panel {
@@ -133,6 +154,8 @@ h1 {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  min-height: 0;
+  overflow: auto;
 }
 
 label {
@@ -210,12 +233,14 @@ textarea { resize: vertical; }
   display: grid;
   grid-template-rows: 1fr auto;
   min-width: 0;
+  min-height: 0;
   overflow: hidden;
 }
 
 .messages {
   padding: 20px;
   overflow: auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -239,6 +264,146 @@ textarea { resize: vertical; }
 .message.assistant { align-self: flex-start; }
 .message.tool { align-self: stretch; max-width: 100%; border-color: rgba(125, 211, 252, 0.28); }
 .message.error { border-color: rgba(251, 113, 133, 0.45); color: #fecdd3; }
+
+.progress-card {
+  position: relative;
+  overflow: hidden;
+  border-color: rgba(125, 211, 252, 0.42);
+  background:
+    linear-gradient(135deg, rgba(14, 116, 144, 0.18), rgba(15, 23, 42, 0.74)),
+    rgba(15, 23, 42, 0.74);
+}
+
+.progress-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(125, 211, 252, 0.12), transparent);
+  animation: sweep 2.2s infinite;
+}
+
+.progress-header {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.progress-header + span {
+  position: relative;
+  z-index: 1;
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+}
+
+.progress-timer {
+  color: var(--accent);
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+
+.scanner {
+  width: 34px;
+  height: 34px;
+  border-radius: 12px;
+  border: 1px solid rgba(125, 211, 252, 0.35);
+  background: rgba(125, 211, 252, 0.08);
+  position: relative;
+  overflow: hidden;
+}
+
+.scanner::after {
+  content: '';
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  height: 3px;
+  top: 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 18px var(--accent);
+  animation: scanline 1.1s ease-in-out infinite alternate;
+}
+
+.scanner.done::after {
+  top: 15px;
+  background: var(--green);
+  animation: none;
+}
+
+.scanner.failed::after {
+  top: 15px;
+  background: var(--red);
+  animation: none;
+}
+
+.voice-scanner::after {
+  height: 22px;
+  width: 4px;
+  left: 14px;
+  right: auto;
+  top: 6px;
+  animation: voiceNeedle 0.7s ease-in-out infinite alternate;
+}
+
+.waveform {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 46px;
+  margin-top: 12px;
+}
+
+.waveform span {
+  width: 5px;
+  height: 14px;
+  border-radius: 999px;
+  background: linear-gradient(180deg, var(--accent), rgba(20, 184, 166, 0.55));
+  animation: waveform 0.9s ease-in-out infinite alternate;
+}
+
+.waveform span:nth-child(2n) { animation-delay: 0.12s; }
+.waveform span:nth-child(3n) { animation-delay: 0.24s; }
+.waveform span:nth-child(4n) { animation-delay: 0.36s; }
+
+.progress-track {
+  position: relative;
+  z-index: 1;
+  height: 8px;
+  margin-top: 14px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.12);
+  overflow: hidden;
+}
+
+.progress-fill {
+  width: 42%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, rgba(20, 184, 166, 0.85), rgba(56, 189, 248, 0.9));
+  animation: indeterminate 1.4s ease-in-out infinite;
+}
+
+.progress-step {
+  position: relative;
+  z-index: 1;
+  margin-top: 12px;
+  color: var(--muted);
+}
+
+.progress-done {
+  border-color: rgba(134, 239, 172, 0.32);
+}
+
+.progress-failed {
+  border-color: rgba(251, 113, 133, 0.42);
+}
 
 .meta {
   margin-top: 10px;
@@ -285,9 +450,37 @@ textarea { resize: vertical; }
   50% { opacity: 0; }
 }
 
+@keyframes scanline {
+  from { transform: translateY(0); }
+  to { transform: translateY(21px); }
+}
+
+@keyframes indeterminate {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(260%); }
+}
+
+@keyframes sweep {
+  100% { transform: translateX(100%); }
+}
+
+@keyframes voiceNeedle {
+  from { transform: scaleY(0.45); opacity: 0.7; }
+  to { transform: scaleY(1); opacity: 1; }
+}
+
+@keyframes waveform {
+  from { transform: scaleY(0.45); opacity: 0.55; }
+  to { transform: scaleY(2.2); opacity: 1; }
+}
+
+@keyframes recordingPulse {
+  50% { box-shadow: 0 0 0 4px rgba(251, 113, 133, 0.12), 0 10px 30px rgba(127, 29, 29, 0.35); }
+}
+
 .composer {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: 1fr auto auto;
   gap: 12px;
   padding: 16px;
   border-top: 1px solid var(--line);
@@ -295,8 +488,11 @@ textarea { resize: vertical; }
 }
 
 @media (max-width: 900px) {
+  body { overflow: auto; }
+  .shell { height: auto; min-height: 100vh; overflow: visible; }
   .hero { align-items: stretch; flex-direction: column; }
-  .workspace { grid-template-columns: 1fr; }
+  .workspace { grid-template-columns: 1fr; overflow: visible; }
+  .chat-panel { min-height: 70vh; }
   .composer { grid-template-columns: 1fr; }
   .message { max-width: 100%; }
 }

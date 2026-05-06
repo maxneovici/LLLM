@@ -1,7 +1,11 @@
 const state = {
   model: '',
   busy: false,
-  currentDocument: null
+  currentDocument: null,
+  mediaRecorder: null,
+  audioChunks: [],
+  recordingStartedAt: 0,
+  recordingTimer: null
 };
 
 const modelSelect = document.querySelector('#modelSelect');
@@ -16,6 +20,7 @@ const invoiceButton = document.querySelector('#invoiceButton');
 const messages = document.querySelector('#messages');
 const chatForm = document.querySelector('#chatForm');
 const messageInput = document.querySelector('#messageInput');
+const voiceButton = document.querySelector('#voiceButton');
 const healthDot = document.querySelector('#healthDot');
 const healthText = document.querySelector('#healthText');
 const healthSubtext = document.querySelector('#healthSubtext');
@@ -36,6 +41,7 @@ function bindEvents() {
   fileInput.addEventListener('change', () => uploadFile(fileInput.files[0]));
   ocrButton.addEventListener('click', () => runDocumentAction('/api/ocr', 'OCR'));
   invoiceButton.addEventListener('click', () => runDocumentAction('/api/invoice', 'Invoice extraction'));
+  voiceButton.addEventListener('click', toggleRecording);
 
   dropzone.addEventListener('dragover', event => {
     event.preventDefault();
@@ -66,6 +72,81 @@ function bindEvents() {
     event.preventDefault();
     chatForm.requestSubmit();
   });
+}
+
+async function toggleRecording() {
+  if (state.mediaRecorder?.state === 'recording') {
+    state.mediaRecorder.stop();
+    return;
+  }
+
+  if (state.busy) return;
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    state.audioChunks = [];
+    state.mediaRecorder = new MediaRecorder(stream);
+    state.mediaRecorder.addEventListener('dataavailable', event => {
+      if (event.data.size > 0) {
+        state.audioChunks.push(event.data);
+      }
+    });
+    state.mediaRecorder.addEventListener('stop', async () => {
+      stream.getTracks().forEach(track => track.stop());
+      stopRecordingUi();
+      await transcribeRecording();
+    });
+
+    state.mediaRecorder.start();
+    startRecordingUi();
+  } catch (error) {
+    addMessage('error', `Microphone unavailable: ${error.message}`);
+  }
+}
+
+function startRecordingUi() {
+  state.recordingStartedAt = performance.now();
+  voiceButton.classList.add('recording');
+  voiceButton.textContent = 'Stop 0.0s';
+  state.recordingTimer = window.setInterval(() => {
+    voiceButton.textContent = `Stop ${((performance.now() - state.recordingStartedAt) / 1000).toFixed(1)}s`;
+  }, 250);
+}
+
+function stopRecordingUi() {
+  if (state.recordingTimer) {
+    window.clearInterval(state.recordingTimer);
+  }
+
+  voiceButton.classList.remove('recording');
+  voiceButton.textContent = 'Mic';
+}
+
+async function transcribeRecording() {
+  if (state.audioChunks.length === 0) return;
+
+  setBusy(true);
+  const progress = createVoiceProgress();
+
+  try {
+    const blob = new Blob(state.audioChunks, { type: state.audioChunks[0]?.type || 'audio/webm' });
+    const form = new FormData();
+    form.append('audio', blob, 'recording.webm');
+
+    progress.setStep('Sending audio to local whisper.cpp');
+    const response = await fetch('/api/transcribe', { method: 'POST', body: form });
+    progress.setStep('Reading local transcript');
+    const result = await readJsonOrThrow(response);
+    const existingText = messageInput.value.trim();
+    messageInput.value = existingText ? `${existingText}\n${result.text}` : result.text;
+    messageInput.focus();
+    progress.complete(result);
+  } catch (error) {
+    progress.fail(error);
+    addMessage('error', `Voice transcription failed: ${error.message}`);
+  } finally {
+    setBusy(false);
+  }
 }
 
 async function checkHealth() {
@@ -254,20 +335,135 @@ async function runDocumentAction(endpoint, label) {
 
   setBusy(true);
   addMessage('user', `${label}: ${state.currentDocument.originalName}`);
+  const progress = createDocumentProgress(label, state.currentDocument);
 
   try {
+    progress.setStep('Uploading request to local app');
     const response = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: state.model, pages: 3 })
     });
+    progress.setStep('Reading local model response');
     const result = await readJsonOrThrow(response);
+    progress.complete(result);
     renderDocumentResult(result);
   } catch (error) {
+    progress.fail(error);
     addMessage('error', error.message);
   } finally {
     setBusy(false);
   }
+}
+
+function createDocumentProgress(label, document) {
+  const startedAt = performance.now();
+  const bubble = documentCreate('article', 'message tool progress-card');
+  const header = documentCreate('div', 'progress-header');
+  const spinner = documentCreate('div', 'scanner');
+  const title = documentCreate('strong', '', `${label} running locally`);
+  const subtitle = documentCreate('span', '', document.originalName);
+  const timer = documentCreate('span', 'progress-timer', '0.0 s');
+  const step = documentCreate('div', 'progress-step', 'Preparing local OCR pipeline');
+  const track = documentCreate('div', 'progress-track');
+  const fill = documentCreate('div', 'progress-fill');
+  track.appendChild(fill);
+  header.append(spinner, title, timer);
+  bubble.append(header, subtitle, track, step);
+  messages.appendChild(bubble);
+  messages.scrollTop = messages.scrollHeight;
+
+  const statusSteps = [
+    'Rendering PDF/image locally',
+    'Sending page image to Ollama',
+    'Waiting for local vision model',
+    'Extracting structured text',
+    'Collecting timing and token stats'
+  ];
+  let statusIndex = 0;
+
+  const interval = window.setInterval(() => {
+    const elapsedMs = performance.now() - startedAt;
+    timer.textContent = formatMs(elapsedMs);
+
+    if (elapsedMs > 5000 && Math.floor(elapsedMs / 5000) > statusIndex && statusIndex < statusSteps.length) {
+      step.textContent = statusSteps[statusIndex];
+      statusIndex += 1;
+    }
+  }, 200);
+
+  return {
+    setStep(text) {
+      step.textContent = text;
+    },
+    complete(result) {
+      window.clearInterval(interval);
+      bubble.classList.remove('progress-card');
+      bubble.classList.add('progress-done');
+      spinner.classList.add('done');
+      timer.textContent = formatMs(result.totalDurationMs ?? performance.now() - startedAt);
+      step.textContent = `${label} complete. ${result.pages?.length ?? 0} page(s) processed.`;
+    },
+    fail(error) {
+      window.clearInterval(interval);
+      bubble.classList.remove('progress-card');
+      bubble.classList.add('progress-failed');
+      spinner.classList.add('failed');
+      step.textContent = `Failed: ${error.message}`;
+    }
+  };
+}
+
+function createVoiceProgress() {
+  const startedAt = performance.now();
+  const bubble = documentCreate('article', 'message tool progress-card voice-progress');
+  const header = documentCreate('div', 'progress-header');
+  const spinner = documentCreate('div', 'scanner voice-scanner');
+  const title = documentCreate('strong', '', 'Transcribing voice locally');
+  const timer = documentCreate('span', 'progress-timer', '0.0 s');
+  const step = documentCreate('div', 'progress-step', 'Preparing local speech model');
+  const waveform = documentCreate('div', 'waveform');
+
+  for (let index = 0; index < 18; index++) {
+    waveform.appendChild(documentCreate('span'));
+  }
+
+  header.append(spinner, title, timer);
+  bubble.append(header, waveform, step);
+  messages.appendChild(bubble);
+  messages.scrollTop = messages.scrollHeight;
+
+  const interval = window.setInterval(() => {
+    timer.textContent = formatMs(performance.now() - startedAt);
+  }, 200);
+
+  return {
+    setStep(text) {
+      step.textContent = text;
+    },
+    complete(result) {
+      window.clearInterval(interval);
+      bubble.classList.remove('progress-card');
+      bubble.classList.add('progress-done');
+      spinner.classList.add('done');
+      timer.textContent = formatMs(result.durationMs ?? performance.now() - startedAt);
+      step.textContent = `Transcript inserted into prompt (${result.text.length} chars).`;
+    },
+    fail(error) {
+      window.clearInterval(interval);
+      bubble.classList.remove('progress-card');
+      bubble.classList.add('progress-failed');
+      spinner.classList.add('failed');
+      step.textContent = `Failed: ${error.message}`;
+    }
+  };
+}
+
+function documentCreate(tag, className = '', text = '') {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text) element.textContent = text;
+  return element;
 }
 
 function renderChatResult(result) {
@@ -317,7 +513,8 @@ async function readJsonOrThrow(response) {
 
 function setBusy(busy) {
   state.busy = busy;
-  for (const element of [refreshModels, ocrButton, invoiceButton, chatForm.querySelector('button')]) {
+  document.body.classList.toggle('busy', busy);
+  for (const element of [refreshModels, ocrButton, invoiceButton, chatForm.querySelector('button[type="submit"]')]) {
     element.disabled = busy;
   }
 }

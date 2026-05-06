@@ -1,6 +1,7 @@
 bin/
 obj/
 App_Data/
+models/
 .DS_Store
 *.user
 *.suo
